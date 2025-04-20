@@ -28,10 +28,22 @@ interface PnlChartProps {
   matchedTrades: any[];
 }
 
+interface Trade {
+  Ticker: string;
+  Exit_Date: string | Date;
+  Net_Profit: number;
+}
+
 interface CumulativePnlItem {
   timestamp: number;
   pnl: number;
+  trades: {
+    ticker: string;
+    profit: number;
+  }[];
 }
+
+type TimePoint = [number, Trade[]];
 
 export default function PnlChart({ matchedTrades }: PnlChartProps) {
   const [chartData, setChartData] = useState<any>(null);
@@ -44,25 +56,49 @@ export default function PnlChart({ matchedTrades }: PnlChartProps) {
       (a, b) => new Date(a.Exit_Date).getTime() - new Date(b.Exit_Date).getTime()
     );
 
-    // Compute cumulative PNL for each trade
-    const cumulativePnl: CumulativePnlItem[] = sortedTrades.reduce((acc: CumulativePnlItem[], trade, index) => {
-      const previousTotal = index > 0 ? acc[index - 1].pnl : 0;
-      return [
-        ...acc,
-        {
-          timestamp: new Date(trade.Exit_Date).getTime(),
-          pnl: previousTotal + trade.Net_Profit,
-        },
-      ];
-    }, []);
+    // Group trades by timestamp (minute precision) to prevent stacking
+    const tradesByTimestamp = sortedTrades.reduce((acc: Map<number, Trade[]>, trade) => {
+      const date = new Date(trade.Exit_Date);
+      // Round to nearest minute to group trades that happen very close together
+      date.setSeconds(0, 0);
+      const timestamp = date.getTime();
+      
+      if (!acc.has(timestamp)) {
+        acc.set(timestamp, []);
+      }
+      acc.get(timestamp)!.push(trade);
+      return acc;
+    }, new Map());
+
+    // Convert to array and sort by timestamp
+    const timePoints: TimePoint[] = Array.from(tradesByTimestamp.entries());
+    timePoints.sort((a, b) => a[0] - b[0]);
 
     // Add starting point at the first trade's timestamp with 0 PNL
-    const startPoint = {
-      timestamp: new Date(sortedTrades[0].Exit_Date).getTime() - 24 * 60 * 60 * 1000, // 1 day before first trade
-      pnl: 0
-    };
+    const startTimestamp = timePoints[0][0] - 24 * 60 * 60 * 1000; // 1 day before first trade
+    const dataPoints: CumulativePnlItem[] = [{
+      timestamp: startTimestamp,
+      pnl: 0,
+      trades: []
+    }];
 
-    const dataPoints = [startPoint, ...cumulativePnl];
+    // Calculate cumulative PNL for each time point
+    let runningPnl = 0;
+    timePoints.forEach((timePoint: TimePoint) => {
+      const [timestamp, trades] = timePoint;
+      // Sum up all profits for trades at this timestamp
+      const timestampPnl = trades.reduce((sum: number, trade: Trade) => sum + trade.Net_Profit, 0);
+      runningPnl += timestampPnl;
+
+      dataPoints.push({
+        timestamp,
+        pnl: runningPnl,
+        trades: trades.map((trade: Trade) => ({
+          ticker: trade.Ticker,
+          profit: trade.Net_Profit
+        }))
+      });
+    });
 
     setChartData({
       datasets: [
@@ -75,8 +111,17 @@ export default function PnlChart({ matchedTrades }: PnlChartProps) {
           borderColor: 'rgb(75, 192, 192)',
           backgroundColor: 'rgba(75, 192, 192, 0.5)',
           tension: 0.1,
-          pointRadius: 3,
-          pointHoverRadius: 5,
+          pointRadius: (ctx: any) => {
+            // Make points larger when there are multiple trades
+            const index = ctx.dataIndex;
+            const trades = dataPoints[index]?.trades || [];
+            return trades.length > 1 ? 5 : 3;
+          },
+          pointHoverRadius: (ctx: any) => {
+            const index = ctx.dataIndex;
+            const trades = dataPoints[index]?.trades || [];
+            return trades.length > 1 ? 7 : 5;
+          },
         },
       ],
     });
@@ -109,7 +154,23 @@ export default function PnlChart({ matchedTrades }: PnlChartProps) {
             });
           },
           label: (context: any) => {
-            return `PNL: ${formatCurrency(context.parsed.y)}`;
+            const index = context.dataIndex;
+            const dataPoint = chartData.datasets[0].data[index];
+            const trades = (dataPoint as any).trades || [];
+            
+            if (trades.length === 0) {
+              return `PNL: ${formatCurrency(context.parsed.y)}`;
+            }
+
+            const lines = [
+              `Total PNL: ${formatCurrency(context.parsed.y)}`,
+              `Trades settled: ${trades.length}`,
+              '',
+              ...trades.map((t: any) => 
+                `${t.ticker}: ${formatCurrency(t.profit)}`
+              )
+            ];
+            return lines;
           }
         }
       }
