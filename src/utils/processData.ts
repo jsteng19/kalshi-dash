@@ -251,8 +251,7 @@ const matchTradesFifo = (trades: Trade[]): MatchedTrade[] => {
   console.log(`Unmatched exits: ${unmatchedExits}`);
   console.log(`Open positions remaining: ${Object.values(openPositions).reduce((sum, pos) => sum + pos.length, 0)}`);
   
-  // Remove unreasonable ROIs
-  return completedTrades.filter(t => Math.abs(t.ROI!) < 10);
+  return completedTrades;
 };
 
 // Calculate basic statistics
