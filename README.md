@@ -1,36 +1,67 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Kalshi Dashboard
 
-## Getting Started
+A performance tracker for Kalshi traders that helps visualize PNL over time and analyse trading statistics
 
-First, run the development server:
+## Project Overview
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+This dashboard allows Kalshi traders to:
+- Upload transaction CSV files from their Kalshi account
+- Visualize profit/loss over time
+- Analyze trading statistics
+- See breakdowns by trade direction (Yes/No) and settlement types
+- Track performance metrics for better trading decisions
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+All processing happens client-side, so your data remains private.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Planned Features
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- More useful stats like max drawdown, variance, Sharpe, etc
+- Drill-down feature to filter stats and PNL plot by different categories, trade direction, etc
+- Plot of distribution of returns
+- Position sizing analysis
 
-## Learn More
+## Technologies
 
-To learn more about Next.js, take a look at the following resources:
+- Next.js 14
+- React with TypeScript
+- Tailwind CSS
+- Chart.js (for data visualization)
+- Papa Parse (for CSV parsing)
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Project Structure
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- `/src/app` - Next.js App Router files
+- `/src/components` - React components
+- `/src/utils` - Data processing utilities
+- `/public` - Static assets
 
-## Deploy on Vercel
+## Running Locally
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/jsteng19/kalshi-dash.git
+   cd kalshi-dash
+   ```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+2. Install dependencies:
+   ```bash
+   npm install
+   ```
+
+3. Start the development server:
+   ```bash
+   npm run dev
+   ```
+
+4. Open [http://localhost:3000](http://localhost:3000) in your browser
+
+## Usage
+
+1. Download your transaction CSV files from Kalshi (from the Documents section in the Desktop site) 
+2. Upload the files
+3. View your trading analytics and performance metrics
+
+## Deployment
+
+The project is deployed on Github Pages. You can access the live version at:
+[https://jsteng19.github.io/kalshi-dash/](https://jsteng19.github.io/kalshi-dash/)
