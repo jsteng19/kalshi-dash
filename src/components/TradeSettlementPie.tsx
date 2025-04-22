@@ -14,11 +14,11 @@ interface TradeSettlementPieProps {
 export default function TradeSettlementPie({ matchedTrades }: TradeSettlementPieProps) {
   // Calculate the number of contracts settled vs sold
   const settledContracts = matchedTrades
-    .filter(t => t.Exit_Direction === 'settlement')
+    .filter(t => t.Exit_Type === 'settlement')
     .reduce((sum, t) => sum + t.Contracts, 0);
   
   const soldContracts = matchedTrades
-    .filter(t => t.Exit_Direction !== 'settlement')
+    .filter(t => t.Exit_Type !== 'settlement')
     .reduce((sum, t) => sum + t.Contracts, 0);
 
   const data = {

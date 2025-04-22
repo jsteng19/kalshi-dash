@@ -20,10 +20,9 @@ export interface MatchedTrade {
   Entry_Date: Date;
   Exit_Date: Date;
   Entry_Direction: string;
-  Exit_Direction: string;
+  Exit_Type: string;
   Contracts: number;
   Entry_Cost: number;
-  Exit_Cost: number;
   Realized_Profit: number;
   Net_Profit: number;
   Holding_Period_Days: number;
@@ -185,23 +184,13 @@ const matchTradesFifo = (trades: Trade[]): MatchedTrade[] => {
           finalExitPrice = exitPrice;
         } else {
           // For opposite direction trades, calculate profit based on price difference
-          if (position.direction !== direction) {
-            const entryPrice = position.avg_price;
-            if (position.direction === 'Yes') { // YES entry, NO exit
-              finalExitPrice = 100 - trade.Average_Price; // Effective sell price
-              profit = contractsClosed * (100 - entryPrice - trade.Average_Price) / 100;
-            } else { // NO entry, YES exit
-              finalExitPrice = 100 - trade.Average_Price; // Effective sell price
-              profit = contractsClosed * (100 - trade.Average_Price - entryPrice) / 100;
-            }
-          } else {
-            finalExitPrice = trade.Average_Price;
-            profit = realizedProfitPerContract * contractsClosed;
-          }
+          (position.direction !== direction) 
+          const entryPrice = position.avg_price;
+          finalExitPrice = 100 - exitPrice; // Effective sell price
+          profit = contractsClosed * (100 - entryPrice - exitPrice) / 100;
         }
         
         const entryCost = position.cost * (contractsClosed / position.contracts);
-        const exitCost = Math.abs(trade.Realized_Cost) * (contractsClosed / trade.Contracts);
         
         // Calculate proportional fees
         const proportionalEntryFee = position.entry_fee * (contractsClosed / position.contracts);
@@ -213,10 +202,9 @@ const matchTradesFifo = (trades: Trade[]): MatchedTrade[] => {
           Entry_Date: position.entry_date,
           Exit_Date: trade.Date,
           Entry_Direction: position.direction,
-          Exit_Direction: trade.Type,
+          Exit_Type: trade.Type,
           Contracts: contractsClosed,
           Entry_Cost: entryCost,
-          Exit_Cost: exitCost,
           Realized_Profit: profit,
           Net_Profit: profit - totalFees,
           Holding_Period_Days: (trade.Date.getTime() - position.entry_date.getTime()) / (24 * 3600 * 1000),
@@ -303,7 +291,7 @@ const calculateBasicStats = (trades: Trade[], matchedTrades: MatchedTrade[]) => 
   const winRate = matchedTrades.filter(t => t.Net_Profit > 0).length / matchedTrades.length;
   
   // Win rate (settled contracts only)
-  const settledTrades = matchedTrades.filter(t => t.Exit_Direction === 'settlement');
+  const settledTrades = matchedTrades.filter(t => t.Exit_Type === 'settlement');
   const settledWinRate = settledTrades.length > 0 
     ? settledTrades.filter(t => t.Net_Profit > 0).length / settledTrades.length 
     : 0;
