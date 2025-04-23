@@ -22,7 +22,6 @@ function App() {
           <div className="mt-8">
             <Overview 
               stats={processedData.basicStats} 
-              matchedTrades={processedData.matchedTrades} 
               trades={processedData.trades}
             />
             <PnlChart trades={processedData.trades} />

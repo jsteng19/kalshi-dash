@@ -186,7 +186,6 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
           
           <Overview 
             stats={processedData.basicStats} 
-            matchedTrades={processedData.matchedTrades}
             trades={processedData.trades}
           />
           
