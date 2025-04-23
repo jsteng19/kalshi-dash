@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import Papa from 'papaparse';
 import { processCSVData, ProcessedData, combineProcessedData } from '@/utils/processData';
 import Overview from '@/components/Overview';
@@ -23,6 +23,7 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
   const [error, setError] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
@@ -82,6 +83,28 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
     setProcessedData(null);
     setError('');
     setUploadedFiles([]);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+    if (onFileUpload) {
+      onFileUpload({
+        originalData: [],
+        trades: [],
+        matchedTrades: [],
+        basicStats: {
+          uniqueTickers: 0,
+          totalTrades: 0,
+          yesNoBreakdown: { Yes: 0, No: 0 },
+          totalFees: 0,
+          totalProfit: 0,
+          avgContractPurchasePrice: 0,
+          avgContractFinalPrice: 0,
+          weightedHoldingPeriod: 0,
+          winRate: 0,
+          settledWinRate: 0
+        }
+      });
+    }
   };
 
   return (
@@ -107,6 +130,7 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
         </label>
         <div className="flex flex-col sm:flex-row gap-3">
           <input
+            ref={fileInputRef}
             type="file"
             accept=".csv"
             multiple
@@ -157,12 +181,13 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
           {/* PNL chart moved to the top */}
           <div className="mb-6">
             <h2 className="text-xl font-semibold mb-4 text-center">Profit & Loss Over Time</h2>
-            <PnlChart matchedTrades={processedData.matchedTrades} />
+            <PnlChart trades={processedData.trades} />
           </div>
           
           <Overview 
             stats={processedData.basicStats} 
             matchedTrades={processedData.matchedTrades}
+            trades={processedData.trades}
           />
           
           {/* Improved pie charts layout */}
@@ -181,7 +206,7 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
               <div className="bg-white shadow rounded-lg p-6">
                 <h3 className="text-lg font-medium text-gray-700 mb-4 text-center">Settlement vs Exit</h3>
                 <div className="h-[300px] w-full">
-                  <TradeSettlementPie matchedTrades={processedData.matchedTrades} />
+                  <TradeSettlementPie trades={processedData.trades} />
                 </div>
               </div>
             </div>

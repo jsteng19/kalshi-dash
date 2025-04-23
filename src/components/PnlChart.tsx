@@ -25,13 +25,18 @@ ChartJS.register(
 );
 
 interface PnlChartProps {
-  matchedTrades: any[];
+  trades: any[];
 }
 
 interface Trade {
   Ticker: string;
-  Exit_Date: string | Date;
-  Net_Profit: number;
+  Created: string;
+  Realized_Profit: number;
+  Type: string;
+  Direction: string;
+  Contracts: number;
+  Average_Price: number;
+  Realized_Revenue: number;
 }
 
 interface CumulativePnlItem {
@@ -40,25 +45,29 @@ interface CumulativePnlItem {
   trades: {
     ticker: string;
     profit: number;
+    type: string;
+    direction: string;
+    contracts: number;
+    price: number;
   }[];
 }
 
 type TimePoint = [number, Trade[]];
 
-export default function PnlChart({ matchedTrades }: PnlChartProps) {
+export default function PnlChart({ trades }: PnlChartProps) {
   const [chartData, setChartData] = useState<any>(null);
 
   useEffect(() => {
-    if (!matchedTrades || matchedTrades.length === 0) return;
+    if (!trades || trades.length === 0) return;
 
-    // Sort trades by exit date
-    const sortedTrades = [...matchedTrades].sort(
-      (a, b) => new Date(a.Exit_Date).getTime() - new Date(b.Exit_Date).getTime()
+    // Sort trades by created date
+    const sortedTrades = [...trades].sort(
+      (a, b) => new Date(a.Created).getTime() - new Date(b.Created).getTime()
     );
 
     // Group trades by timestamp (minute precision) to prevent stacking
     const tradesByTimestamp = sortedTrades.reduce((acc: Map<number, Trade[]>, trade) => {
-      const date = new Date(trade.Exit_Date);
+      const date = new Date(trade.Created);
       // Round to nearest minute to group trades that happen very close together
       date.setSeconds(0, 0);
       const timestamp = date.getTime();
@@ -87,7 +96,7 @@ export default function PnlChart({ matchedTrades }: PnlChartProps) {
     timePoints.forEach((timePoint: TimePoint) => {
       const [timestamp, trades] = timePoint;
       // Sum up all profits for trades at this timestamp
-      const timestampPnl = trades.reduce((sum: number, trade: Trade) => sum + trade.Net_Profit, 0);
+      const timestampPnl = trades.reduce((sum: number, trade: Trade) => sum + trade.Realized_Profit, 0);
       runningPnl += timestampPnl;
 
       dataPoints.push({
@@ -95,7 +104,11 @@ export default function PnlChart({ matchedTrades }: PnlChartProps) {
         pnl: runningPnl,
         trades: trades.map((trade: Trade) => ({
           ticker: trade.Ticker,
-          profit: trade.Net_Profit
+          profit: trade.Realized_Profit,
+          type: trade.Type,
+          direction: trade.Direction,
+          contracts: trade.Contracts,
+          price: trade.Average_Price
         }))
       });
     });
@@ -106,13 +119,13 @@ export default function PnlChart({ matchedTrades }: PnlChartProps) {
           label: 'Cumulative PNL ($)',
           data: dataPoints.map(point => ({
             x: point.timestamp,
-            y: point.pnl
+            y: point.pnl,
+            trades: point.trades
           })),
           borderColor: 'rgb(75, 192, 192)',
           backgroundColor: 'rgba(75, 192, 192, 0.5)',
           tension: 0.1,
           pointRadius: (ctx: any) => {
-            // Make points larger when there are multiple trades
             const index = ctx.dataIndex;
             const trades = dataPoints[index]?.trades || [];
             return trades.length > 1 ? 5 : 3;
@@ -125,7 +138,7 @@ export default function PnlChart({ matchedTrades }: PnlChartProps) {
         },
       ],
     });
-  }, [matchedTrades]);
+  }, [trades]);
 
   const options = {
     responsive: true,
@@ -156,7 +169,7 @@ export default function PnlChart({ matchedTrades }: PnlChartProps) {
           label: (context: any) => {
             const index = context.dataIndex;
             const dataPoint = chartData.datasets[0].data[index];
-            const trades = (dataPoint as any).trades || [];
+            const trades = dataPoint.trades || [];
             
             if (trades.length === 0) {
               return `PNL: ${formatCurrency(context.parsed.y)}`;
@@ -164,10 +177,10 @@ export default function PnlChart({ matchedTrades }: PnlChartProps) {
 
             const lines = [
               `Total PNL: ${formatCurrency(context.parsed.y)}`,
-              `Trades settled: ${trades.length}`,
+              `Trades: ${trades.length}`,
               '',
               ...trades.map((t: any) => 
-                `${t.ticker}: ${formatCurrency(t.profit)}`
+                `${t.ticker} (${t.type}, ${t.direction}): ${formatCurrency(t.profit)}`
               )
             ];
             return lines;
@@ -195,7 +208,7 @@ export default function PnlChart({ matchedTrades }: PnlChartProps) {
           displayFormats: {
             day: 'MMM d',
           },
-          tooltipFormat: 'PPpp', // Detailed format for tooltip
+          tooltipFormat: 'PPpp',
         },
         adapters: {
           date: Date,

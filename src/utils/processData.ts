@@ -1,6 +1,6 @@
 import { parse } from 'papaparse';
 
-interface Trade {
+export interface Trade {
   Ticker: string;
   Type: string;
   Direction: string;
@@ -249,52 +249,65 @@ const calculateBasicStats = (trades: Trade[], matchedTrades: MatchedTrade[]) => 
   
   // Yes/No breakdown
   const yesNoBreakdown = trades.reduce((acc, trade) => {
-    acc[trade.Direction] = (acc[trade.Direction] || 0) + 1;
+    // For settlements, count contracts in the listed direction
+    if (trade.Type === 'settlement') {
+      acc[trade.Direction] = (acc[trade.Direction] || 0) + trade.Contracts;
+    }
+    else if (trade.Realized_Revenue > 0) {
+      // Count closed contracts in opposite direction
+      const oppositeDir = trade.Direction === 'Yes' ? 'No' : 'Yes';
+      acc[oppositeDir] = (acc[oppositeDir] || 0) + trade.Realized_Revenue;
+      
+    }
     return acc;
   }, {} as Record<string, number>);
   
-  // Total fees
+  // Total fees and profit directly from trades
   const totalFees = trades.reduce((sum, trade) => sum + (trade.Fees || 0), 0);
+  const totalProfit = trades.reduce((sum, trade) => sum + trade.Realized_Profit, 0);
+
+  // Calculate average entry and exit prices from exit trades only
+  let totalWeightedEntryPrice = 0;
+  let totalWeightedExitPrice = 0;
+  let totalExitedContracts = 0;
+
+  trades.forEach(trade => {
+    if (trade.Type === 'settlement') {
+      if (trade.Contracts > 0) {
+        totalWeightedEntryPrice += trade.Average_Price * trade.Contracts;
+        totalWeightedExitPrice += (trade.Realized_Revenue > 0 ? 100 : 0) * trade.Contracts;
+        totalExitedContracts += trade.Contracts;
+      }
+    } else if (trade.Realized_Revenue > 0) {
+      // For exit trades with non-zero Realized_Revenue
+      const contracts = trade.Realized_Revenue;
+      const exitPrice = 100 - trade.Average_Price;
+      const entryPrice = (trade.Realized_Cost * 100 - contracts * trade.Average_Price) / contracts;
+      
+      totalWeightedEntryPrice += entryPrice * contracts;
+      totalWeightedExitPrice += exitPrice * contracts;
+      totalExitedContracts += contracts;
+    }
+  });
+
+  const avgContractPurchasePrice = totalExitedContracts > 0 ? totalWeightedEntryPrice / totalExitedContracts : 0;
+  const avgContractFinalPrice = totalExitedContracts > 0 ? totalWeightedExitPrice / totalExitedContracts : 0;
   
-  // Total profit
-  const totalProfit = matchedTrades.reduce((sum, trade) => sum + trade.Net_Profit, 0);
-  
-  // Calculate total contracts for weighting
-  const totalContracts = matchedTrades.reduce((sum, trade) => sum + trade.Contracts, 0);
-  
-  // For debugging - minimal logging
-  console.log(`Contract price calculation: Total contracts: ${totalContracts}`);
-  
-  // Average contract purchase price (in cents)
-  const avgContractPurchasePrice = matchedTrades.reduce((sum, trade) => {
-    const weight = trade.Contracts / totalContracts;
-    return sum + (trade.Entry_Price * weight);
-  }, 0);
-  
-  // Average contract final price (in cents)
-  const avgContractFinalPrice = matchedTrades.reduce((sum, trade) => {
-    const weight = trade.Contracts / totalContracts;
-    return sum + (trade.Exit_Price * weight);
-  }, 0);
-  
-  // Debug - final results
-  console.log(`Average contract prices: Entry=${avgContractPurchasePrice.toFixed(2)}¢, Exit=${avgContractFinalPrice.toFixed(2)}¢`);
-  
-  // Weighted holding period (weighted by trade size)
+  // Keep using matchedTrades for holding period calculation
   const totalTradeValue = matchedTrades.reduce((sum, trade) => sum + trade.Entry_Cost, 0);
   const weightedHoldingPeriod = matchedTrades.reduce((sum, trade) => {
     const weight = trade.Entry_Cost / totalTradeValue;
     return sum + (trade.Holding_Period_Days * weight);
   }, 0);
   
-  // Win rate (all trades)
-  const winRate = matchedTrades.filter(t => t.Net_Profit > 0).length / matchedTrades.length;
+  // Win rates based on Realized_Profit
+  const exitTrades = trades.filter(t => t.Realized_Revenue > 0);
+  const profitableTrades = exitTrades.filter(t => t.Realized_Profit > 0);
+  const settledTrades = trades.filter(t => t.Type === 'settlement');
+  const profitableSettledTrades = settledTrades.filter(t => t.Realized_Profit > 0);
   
-  // Win rate (settled contracts only)
-  const settledTrades = matchedTrades.filter(t => t.Exit_Type === 'settlement');
-  const settledWinRate = settledTrades.length > 0 
-    ? settledTrades.filter(t => t.Net_Profit > 0).length / settledTrades.length 
-    : 0;
+  const winRate = exitTrades.length > 0 ? profitableTrades.length / exitTrades.length : 0;
+  const settledWinRate = settledTrades.length > 0 ? profitableSettledTrades.length / settledTrades.length : 0;
   
   return {
     uniqueTickers,
@@ -332,36 +345,38 @@ export const processCSVData = (results: any): ProcessedData => {
     
     const rawData = results.data as any[];
     
-    // Convert string values and create Date objects
-    const trades: Trade[] = rawData.filter(row => row && row.Ticker).map(row => {
-      try {
-        // Clean up monetary columns
-        const cleanMoney = (val: string) => {
-          if (!val) return 0;
-          return parseFloat(val.replace('$', '').trim()) || 0;
-        };
-        
-        const trade: Trade = {
-          Ticker: row.Ticker,
-          Type: row.Type,
-          Direction: row.Direction,
-          Contracts: parseFloat(row.Contracts) || 0,
-          Average_Price: parseFloat(row.Average_Price) || 0,
-          Realized_Revenue: cleanMoney(row.Realized_Revenue),
-          Realized_Cost: cleanMoney(row.Realized_Cost),
-          Realized_Profit: cleanMoney(row.Realized_Profit),
-          Fees: row.Fees ? cleanMoney(row.Fees) : 0,
-          Created: row.Created,
-          Date: parseDate(row.Created),
-          Trade_Cost: 0 // Will be calculated later
-        };
-        
-        return trade;
-      } catch (error) {
-        console.error("Error processing row:", row, error);
-        return null;
-      }
-    }).filter(Boolean) as Trade[];
+    // Filter out credit transactions and convert string values and create Date objects
+    const trades: Trade[] = rawData
+      .filter(row => row && row.Ticker && row.Type !== 'credit')
+      .map(row => {
+        try {
+          // Clean up monetary columns
+          const cleanMoney = (val: string) => {
+            if (!val) return 0;
+            return parseFloat(val.replace('$', '').trim()) || 0;
+          };
+          
+          const trade: Trade = {
+            Ticker: row.Ticker,
+            Type: row.Type,
+            Direction: row.Direction,
+            Contracts: parseFloat(row.Contracts) || 0,
+            Average_Price: parseFloat(row.Average_Price) || 0,
+            Realized_Revenue: cleanMoney(row.Realized_Revenue),
+            Realized_Cost: cleanMoney(row.Realized_Cost),
+            Realized_Profit: cleanMoney(row.Realized_Profit),
+            Fees: row.Fees ? cleanMoney(row.Fees) : 0,
+            Created: row.Created,
+            Date: parseDate(row.Created),
+            Trade_Cost: 0 // Will be calculated later
+          };
+          
+          return trade;
+        } catch (error) {
+          console.error("Error processing row:", row, error);
+          return null;
+        }
+      }).filter(Boolean) as Trade[];
     
     if (trades.length === 0) {
       throw new Error("No valid trades found in the CSV file");

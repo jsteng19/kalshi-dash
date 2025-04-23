@@ -20,8 +20,12 @@ function App() {
         <CsvUploader onFileUpload={handleFileUpload} />
         {processedData && (
           <div className="mt-8">
-            <Overview stats={processedData.basicStats} matchedTrades={processedData.matchedTrades} />
-            <PnlChart matchedTrades={processedData.matchedTrades} />
+            <Overview 
+              stats={processedData.basicStats} 
+              matchedTrades={processedData.matchedTrades} 
+              trades={processedData.trades}
+            />
+            <PnlChart trades={processedData.trades} />
             <TradeList trades={processedData.matchedTrades} />
           </div>
         )}
