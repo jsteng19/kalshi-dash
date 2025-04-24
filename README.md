@@ -57,7 +57,7 @@ All processing happens client-side, so your data remains private.
 
 ## Usage
 
-1. Download your transaction CSV files from Kalshi (from the Documents section in the Desktop site) 
+1. Download your transaction CSV files from Kalshi (from the [Documents](https://kalshi.com/account/taxes) section in the Desktop site) 
 2. Upload the files
 3. View your trading analytics and performance metrics
 
