@@ -118,7 +118,7 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
         </p>
         <ol className="list-decimal pl-6 mb-4">
           <li>Log in to your Kalshi account</li>
-          <li>Go to Documents</li>
+          <li>Go to <a href="https://kalshi.com/account/taxes">Documents</a></li>
           <li>Download your transaction history CSV files (one for each year)</li>
           <li>Upload the CSV files below</li>
         </ol>
