@@ -31,12 +31,22 @@ interface PnlChartProps {
 interface Trade {
   Ticker: string;
   Created: string;
+  Date: Date;
   Realized_Profit: number;
   Type: string;
   Direction: string;
   Contracts: number;
   Average_Price: number;
   Realized_Revenue: number;
+}
+
+interface TradeDetail {
+  ticker: string;
+  profit: number;
+  type: string;
+  direction: string;
+  contracts: number;
+  price: number;
 }
 
 interface CumulativePnlItem {
@@ -58,82 +68,76 @@ export default function PnlChart({ trades }: PnlChartProps) {
   const [chartData, setChartData] = useState<any>(null);
 
   useEffect(() => {
-    if (!trades || trades.length === 0) return;
+    if (!trades || trades.length === 0) {
+      setChartData(null);
+      return;
+    }
 
-    // Sort trades by created date
+    // Sort trades by the pre-parsed Date object
     const sortedTrades = [...trades].sort(
-      (a, b) => new Date(a.Created).getTime() - new Date(b.Created).getTime()
+      (a, b) => a.Date.getTime() - b.Date.getTime()
     );
 
-    // Group trades by timestamp (minute precision) to prevent stacking
-    const tradesByTimestamp = sortedTrades.reduce((acc: Map<number, Trade[]>, trade) => {
-      const date = new Date(trade.Created);
-      // Round to nearest minute to group trades that happen very close together
-      date.setSeconds(0, 0);
-      const timestamp = date.getTime();
-      
-      if (!acc.has(timestamp)) {
-        acc.set(timestamp, []);
-      }
-      acc.get(timestamp)!.push(trade);
-      return acc;
-    }, new Map());
+    // Add a starting point at 0 PNL one day before the first trade
+    const firstTradeDate = new Date(sortedTrades[0].Date);
+    const startTimestamp = firstTradeDate.setDate(firstTradeDate.getDate() - 1);
 
-    // Convert to array and sort by timestamp
-    const timePoints: TimePoint[] = Array.from(tradesByTimestamp.entries());
-    timePoints.sort((a, b) => a[0] - b[0]);
-
-    // Add starting point at the first trade's timestamp with 0 PNL
-    const startTimestamp = timePoints[0][0] - 24 * 60 * 60 * 1000; // 1 day before first trade
-    const dataPoints: CumulativePnlItem[] = [{
-      timestamp: startTimestamp,
-      pnl: 0,
+    const dataPoints: {x: number, y: number, trades: TradeDetail[]}[] = [{
+      x: startTimestamp,
+      y: 0,
       trades: []
     }];
-
-    // Calculate cumulative PNL for each time point
-    let runningPnl = 0;
-    timePoints.forEach((timePoint: TimePoint) => {
-      const [timestamp, trades] = timePoint;
-      // Sum up all profits for trades at this timestamp
-      const timestampPnl = trades.reduce((sum: number, trade: Trade) => sum + trade.Realized_Profit, 0);
-      runningPnl += timestampPnl;
-
-      dataPoints.push({
-        timestamp,
-        pnl: runningPnl,
-        trades: trades.map((trade: Trade) => ({
-          ticker: trade.Ticker,
-          profit: trade.Realized_Profit,
-          type: trade.Type,
-          direction: trade.Direction,
-          contracts: trade.Contracts,
-          price: trade.Average_Price
-        }))
-      });
+    
+    // Calculate cumulative PNL
+    let cumulativePnl = 0;
+    sortedTrades.forEach(trade => {
+      cumulativePnl += trade.Realized_Profit;
+      
+      // Group trades that occur at the exact same time
+      const lastPoint = dataPoints[dataPoints.length - 1];
+      if (lastPoint && lastPoint.x === trade.Date.getTime()) {
+        lastPoint.y = cumulativePnl;
+        lastPoint.trades.push({
+            ticker: trade.Ticker,
+            profit: trade.Realized_Profit,
+            type: trade.Type,
+            direction: trade.Direction,
+            contracts: trade.Contracts,
+            price: trade.Average_Price,
+        });
+      } else {
+        dataPoints.push({
+          x: trade.Date.getTime(),
+          y: cumulativePnl,
+          trades: [{
+            ticker: trade.Ticker,
+            profit: trade.Realized_Profit,
+            type: trade.Type,
+            direction: trade.Direction,
+            contracts: trade.Contracts,
+            price: trade.Average_Price,
+          }]
+        });
+      }
     });
 
     setChartData({
       datasets: [
         {
           label: 'Cumulative PNL ($)',
-          data: dataPoints.map(point => ({
-            x: point.timestamp,
-            y: point.pnl,
-            trades: point.trades
-          })),
+          data: dataPoints,
           borderColor: 'rgb(75, 192, 192)',
           backgroundColor: 'rgba(75, 192, 192, 0.5)',
           tension: 0.1,
           pointRadius: (ctx: any) => {
             const index = ctx.dataIndex;
-            const trades = dataPoints[index]?.trades || [];
-            return trades.length > 1 ? 5 : 3;
+            const point = dataPoints[index];
+            return point && point.trades.length > 1 ? 5 : 3;
           },
           pointHoverRadius: (ctx: any) => {
             const index = ctx.dataIndex;
-            const trades = dataPoints[index]?.trades || [];
-            return trades.length > 1 ? 7 : 5;
+            const point = dataPoints[index];
+            return point && point.trades.length > 1 ? 7 : 5;
           },
         },
       ],

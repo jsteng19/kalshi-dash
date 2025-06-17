@@ -66,16 +66,33 @@ export interface ProcessedData {
 // Parse date from "Jan 20, 2025 at 10:04 AM PST" format
 const parseDate = (dateStr: string): Date => {
   try {
-    const pattern = /(\w+ \d+, \d+) at (\d+:\d+ [AP]M)/;
+    // Match date, time, and timezone (PST/PDT), with optional space before AM/PM
+    const pattern = /(\w+ \d+, \d+) at (\d+:\d+ ?[AP]M) (P[SD]T)/;
     const match = dateStr.match(pattern);
+
     if (match) {
-      const dateTime = `${match[1]} ${match[2]}`;
-      return new Date(dateTime);
+      const [, date, time, timeZone] = match;
+      // Replace PST/PDT with UTC offsets for reliable parsing
+      const offset = timeZone === "PST" ? "-0800" : "-0700";
+      // Ensure there's a space before AM/PM for `new Date()` compatibility
+      const normalizedTime = time.includes(' ') ? time : time.replace(/([AP]M)/, ' $1');
+      const dateTime = `${date} ${normalizedTime} ${offset}`;
+      const parsedDate = new Date(dateTime);
+      if (!isNaN(parsedDate.getTime())) {
+        return parsedDate;
+      }
     }
-    return new Date();
+    // Fallback for other date formats if necessary
+    const fallbackDate = new Date(dateStr);
+    if (!isNaN(fallbackDate.getTime())) {
+      return fallbackDate;
+    }
+
+    console.error("Failed to parse date:", dateStr);
+    return new Date(); // Or handle as an invalid date
   } catch (error) {
     console.error("Error parsing date:", dateStr, error);
-    return new Date();
+    return new Date(); // Or handle as an invalid date
   }
 };
 
