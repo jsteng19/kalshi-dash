@@ -1,4 +1,5 @@
 import { parse } from 'papaparse';
+import { toDate } from 'date-fns-tz';
 
 export interface Trade {
   Ticker: string;
@@ -63,36 +64,76 @@ export interface ProcessedData {
   };
 }
 
-// Parse date from "Jan 20, 2025 at 10:04 AM PST" format
+// Parse date by converting Kalshi format to standard format for date-fns-tz
 const parseDate = (dateStr: string): Date => {
   try {
-    // Match date, time, and timezone (PST/PDT), with optional space before AM/PM
-    const pattern = /(\w+ \d+, \d+) at (\d+:\d+ ?[AP]M) (P[SD]T)/;
-    const match = dateStr.match(pattern);
-
-    if (match) {
-      const [, date, time, timeZone] = match;
-      // Replace PST/PDT with UTC offsets for reliable parsing
-      const offset = timeZone === "PST" ? "-0800" : "-0700";
-      // Ensure there's a space before AM/PM for `new Date()` compatibility
-      const normalizedTime = time.includes(' ') ? time : time.replace(/([AP]M)/, ' $1');
-      const dateTime = `${date} ${normalizedTime} ${offset}`;
-      const parsedDate = new Date(dateTime);
-      if (!isNaN(parsedDate.getTime())) {
-        return parsedDate;
+    // Check if it's the Kalshi format: "Jan 20, 2025 at 10:04 AM PST"
+    const kalshiPattern = /(\w+ \d+, \d+) at (\d+:\d+) ?([AP]M) ([A-Z]{2,4})/i;
+    const kalshiMatch = dateStr.match(kalshiPattern);
+    
+    if (kalshiMatch) {
+      // Timezone mapping to UTC offsets
+      const timezoneOffsets: Record<string, string> = {
+        'PST': '-08:00', 'PDT': '-07:00', 'PT': '-08:00',
+        'MST': '-07:00', 'MDT': '-06:00', 'MT': '-07:00',
+        'CST': '-06:00', 'CDT': '-05:00', 'CT': '-06:00',
+        'EST': '-05:00', 'EDT': '-04:00', 'ET': '-05:00',
+        'AKST': '-09:00', 'AKDT': '-08:00', 'AKT': '-09:00',
+        'HST': '-10:00', 'HDT': '-09:00', 'HT': '-10:00',
+        'AST': '-04:00', 'ADT': '-03:00', 'AT': '-04:00',
+        'UTC': '+00:00', 'GMT': '+00:00', 'Z': '+00:00'
+      };
+      
+      const [, dateStr, timeStr, ampm, timeZone] = kalshiMatch;
+      const upperTimeZone = timeZone.toUpperCase();
+      const offset = timezoneOffsets[upperTimeZone] || '-08:00'; // Default to PST
+      
+      const dateMatch = dateStr.match(/(\w+) (\d+), (\d+)/);
+      if (dateMatch) {
+        const [, monthName, day, year] = dateMatch;
+        const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        const monthIndex = monthNames.indexOf(monthName);
+        
+        if (monthIndex !== -1) {
+          const month = String(monthIndex + 1).padStart(2, '0');
+          const dayPadded = day.padStart(2, '0');
+          
+          // Parse time: "10:04" + "AM" -> "10:04:00"
+          const [hours, minutes] = timeStr.split(':');
+          let hour24 = parseInt(hours);
+          
+          if (ampm.toUpperCase() === 'PM' && hour24 !== 12) {
+            hour24 += 12;
+          } else if (ampm.toUpperCase() === 'AM' && hour24 === 12) {
+            hour24 = 0;
+          }
+          
+          const hourPadded = String(hour24).padStart(2, '0');
+          
+          // Create ISO format: "2025-01-20T10:04:00-10:00"
+          const isoFormat = `${year}-${month}-${dayPadded}T${hourPadded}:${minutes}:00${offset}`;
+          
+          // Use date-fns-tz to parse the ISO format
+          const parsed = toDate(isoFormat);
+          if (!isNaN(parsed.getTime())) {
+            return parsed;
+          }
+        }
       }
     }
-    // Fallback for other date formats if necessary
+    
+
     const fallbackDate = new Date(dateStr);
     if (!isNaN(fallbackDate.getTime())) {
       return fallbackDate;
     }
 
     console.error("Failed to parse date:", dateStr);
-    return new Date(); // Or handle as an invalid date
+    return new Date(); // Return current date as fallback
   } catch (error) {
     console.error("Error parsing date:", dateStr, error);
-    return new Date(); // Or handle as an invalid date
+    return new Date(); // Return current date as fallback
   }
 };
 
@@ -440,4 +481,32 @@ export const combineProcessedData = (dataArray: ProcessedData[]): ProcessedData 
     matchedTrades,
     basicStats,
   };
+}; 
+
+// Test function for timezone parsing (can be called from console for debugging)
+export const testTimezoneParsing = () => {
+  const testDates = [
+    // Kalshi format with various timezones
+    'Jan 20, 2025 at 10:04 AM HST',
+    'Jan 20, 2025 at 10:04 AM PST',
+    'Jan 20, 2025 at 10:04 AM EST',
+    'Jan 20, 2025 at 2:30 PM CST',
+    'Jan 20, 2025 at 11:45 PM MST',
+    
+    // Variations in formatting
+    'Jan 20, 2025 at 10:04AM HST', // No space before AM
+    'Feb 5, 2025 at 10:04 pm pst', // Lowercase
+    
+    // ISO formats that date-fns-tz should handle directly
+    '2025-01-20T10:04:00-10:00', // HST offset
+    '2025-01-20T10:04:00-08:00', // PST offset
+    '2025-01-20T10:04:00-05:00', // EST offset
+  ];
+  
+  console.log('Testing timezone parsing (Kalshi format -> ISO -> date-fns-tz):');
+  testDates.forEach(dateStr => {
+    const parsed = parseDate(dateStr);
+    const isValid = !isNaN(parsed.getTime());
+    console.log(`${dateStr.padEnd(35)} -> ${parsed.toISOString()} (${isValid ? 'VALID' : 'INVALID'})`);
+  });
 }; 
