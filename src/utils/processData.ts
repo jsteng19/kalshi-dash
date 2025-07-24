@@ -31,8 +31,8 @@ export interface MatchedTrade {
   Entry_Fee: number;
   Exit_Fee: number;
   Total_Fees: number;
-  Entry_Price: number;  // Original entry price in cents
-  Exit_Price: number;   // Original exit price in cents
+  Entry_Price: number;
+  Exit_Price: number;
 }
 
 interface Position {

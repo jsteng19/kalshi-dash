@@ -15,6 +15,7 @@ All processing happens client-side, so your data remains private.
 
 ## Planned Features
 
+- Interest earned
 - More useful stats like max drawdown, variance, Sharpe, etc
 - Drill-down feature to filter stats and PNL plot by different categories, trade direction, etc
 - Plot of distribution of returns

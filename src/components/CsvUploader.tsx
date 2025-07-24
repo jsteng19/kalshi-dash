@@ -7,6 +7,8 @@ import Overview from '@/components/Overview';
 import PnlChart from './PnlChart';
 import TradeDirectionPie from './TradeDirectionPie';
 import TradeSettlementPie from './TradeSettlementPie';
+import RiskAdjustedReturns from './RiskAdjustedReturns';
+import TradeList from './TradeList';
 
 interface CsvData {
   headers: string[];
@@ -178,7 +180,6 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
 
       {processedData && !loading && (
         <div>
-          {/* PNL chart moved to the top */}
           <div className="mb-6">
             <h2 className="text-xl font-semibold mb-4 text-center">Profit & Loss Over Time</h2>
             <PnlChart trades={processedData.trades} />
@@ -189,7 +190,10 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
             trades={processedData.trades}
           />
           
-          {/* Improved pie charts layout */}
+          <RiskAdjustedReturns 
+            matchedTrades={processedData.matchedTrades}
+          />
+          
           <div className="mt-6">
             <h2 className="text-xl font-semibold mb-4 text-center">Trading Distributions</h2>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -210,6 +214,8 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
               </div>
             </div>
           </div>
+          
+          <TradeList trades={processedData.matchedTrades} />
         </div>
       )}
 
