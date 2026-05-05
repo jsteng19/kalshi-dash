@@ -2,7 +2,7 @@
 
 import React, { useMemo, useState } from 'react';
 import { MatchedTrade, calculateSeriesStatsFromMatched, parseTickerComponents, SettlementResult } from '@/utils/processData';
-import { backtestTiers, summarizeTierDistribution, TIER_LADDER, RECENT_ACTIVITY_WINDOW, RECENT_ACTIVITY_THRESHOLD, SeriesBacktest } from '@/utils/tierBacktest';
+import { backtestTiers, backtestThreePoint, consecutiveDaysAtFloor, summarizeTierDistribution, TIER_LADDER, RECENT_ACTIVITY_WINDOW, RECENT_ACTIVITY_THRESHOLD, SeriesBacktest } from '@/utils/tierBacktest';
 
 interface SeriesStatsTableProps {
   matchedTrades: MatchedTrade[];
@@ -207,6 +207,10 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
 
     // Run activity-based backtest: ≥5 trading days in last 14 → 10-step ladder
     const backtest = backtestTiers(allMatchedTrades);
+    // Parallel 3-point tier history for everything else (low-activity series).
+    // Used to enforce the "must sit at 1¢ for N days before disable" guardrail.
+    const tpBacktest = backtestThreePoint(allMatchedTrades);
+    const STINKER_FLOOR_DAYS = 10;
 
     const fmtPct = (v: number) => (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
     const fmtTier = (t: number) => `${t}¢`;
@@ -262,12 +266,14 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
 
       if (bt) {
         // ≥5 trading days in last 14 → 10-step ladder
-        // Stinker: per-frequency threshold + negative all-time + currently at 1¢ floor.
-        // The 1¢ guardrail protects series that are mid-recovery climbing the ladder
-        // even if their cumulative P&L is still red from prior losses.
+        // Stinker: per-frequency age + trade-count + negative all-time + parked
+        // at 1¢ for STINKER_FLOOR_DAYS+ consecutive days. Floor-days guardrail
+        // gives a cooling-off window so a single bad day on r30 doesn't kill a
+        // series that might bounce back.
         const fr = frequencyMap?.get(series);
         const th = stinkerThresh(fr);
-        if (daysSinceFirst >= th.days && stats.tradesCount >= th.trades && stats.pnl < 0 && bt.currentTier === 1) {
+        const daysAtFloor = bt.currentTier === 1 ? consecutiveDaysAtFloor(bt.history, 1) : 0;
+        if (daysSinceFirst >= th.days && stats.tradesCount >= th.trades && stats.pnl < 0 && daysAtFloor >= STINKER_FLOOR_DAYS) {
           stinkers.push(series);
         }
 
@@ -348,12 +354,14 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
           threePointMid.push({ series, comment });
         }
 
-        // Stinker check (3-point branch). Same per-frequency thresholds + 1¢
-        // guardrail (only disable series that have already bottomed out, not
-        // ones the algorithm is parking at 100¢ for insufficient data).
+        // Stinker check (3-point branch). Per-frequency age + trade-count +
+        // negative all-time + parked at 1¢ for STINKER_FLOOR_DAYS+ consecutive
+        // days (using the parallel 3-point backtest history).
         const fr3 = frequencyMap?.get(series);
         const th3 = stinkerThresh(fr3);
-        if (daysSinceFirst >= th3.days && stats.tradesCount >= th3.trades && stats.pnl < 0 && todayTier === 1) {
+        const tpBt = tpBacktest.get(series);
+        const daysAtFloor3 = (tpBt && todayTier === 1) ? consecutiveDaysAtFloor(tpBt.history, 1) : 0;
+        if (daysSinceFirst >= th3.days && stats.tradesCount >= th3.trades && stats.pnl < 0 && daysAtFloor3 >= STINKER_FLOOR_DAYS) {
           stinkers.push(series);
         }
       }
@@ -409,7 +417,7 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
 
     if (stinkers.length) {
       parts.push(
-        `-- Disable stinkers: per-frequency thresholds (hourly/daily 30d, weekly 45d, monthly 60d, annual/one_off/custom 90d), all-time negative, currently at 1¢ floor — ${stinkers.length} series\n` +
+        `-- Disable stinkers: per-frequency thresholds (hourly/daily 30d, weekly 45d, monthly 60d, annual/one_off/custom 90d), all-time negative, parked at 1¢ for ${STINKER_FLOOR_DAYS}+ consecutive days — ${stinkers.length} series\n` +
         `-- Weather markets excluded by category check\n` +
         `UPDATE one_cent_series_filters\nSET enabled = 0\nWHERE series_ticker IN (\n  ${toIn(stinkers)}\n)\nAND category != 'Climate and Weather';`
       );
@@ -777,7 +785,7 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
               <span className="font-medium text-gray-700">{TIER_LADDER.length}-step ladder</span> (≥{RECENT_ACTIVITY_THRESHOLD}d/{RECENT_ACTIVITY_WINDOW}d active): {TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join('→')}. Days 1–3 at 1¢; 3 consecutive r30 ≥ 0 days → +1 level, any r30 &lt; 0 → -1 level. &nbsp;·&nbsp;
               <span className="font-medium text-gray-700">3-point</span> (low activity): 200¢ (positive 30d + 2+ trades), 100¢ (insufficient data), 1¢ (negative 30d + 2+ trades). &nbsp;·&nbsp;
               <span className="font-medium text-gray-700">DELETE</span> — no trades in 60+ days. &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">Disabled stinkers</span> — per-frequency thresholds (hourly/daily 30d/30t, weekly 45d/20t, monthly 60d/6t, annual/one_off 90d), all-time negative, at 1¢ floor, non-weather.
+              <span className="font-medium text-gray-700">Disabled stinkers</span> — per-frequency thresholds (hourly/daily 30d/30t, weekly 45d/20t, monthly 60d/6t, annual/one_off 90d), all-time negative, parked at 1¢ for 10+ consecutive days, non-weather.
             </div>
             <textarea
               readOnly

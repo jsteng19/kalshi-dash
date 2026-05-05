@@ -189,6 +189,124 @@ export function backtestTiers(
   return result;
 }
 
+export interface ThreePointSnapshot {
+  date: string;
+  tier: 1 | 100 | 200;
+  r30: number | null;
+  cumulativeTrades: number;
+  tradesToday: number;
+}
+
+export interface ThreePointBacktest {
+  series: string;
+  firstTradeDate: string;
+  currentTier: 1 | 100 | 200;
+  totalTrades: number;
+  daysTracked: number;
+  lastR30: number | null;
+  history: ThreePointSnapshot[];
+}
+
+function threePointTier(r30: number | null, tradesCount: number): 1 | 100 | 200 {
+  if (r30 !== null && r30 >= 0 && tradesCount >= 2) return 200;
+  if (r30 !== null && r30 < 0 && tradesCount >= 2) return 1;
+  return 100;
+}
+
+/**
+ * Backtest 3-point tier (1 / 100 / 200) per day for series that don't have
+ * enough recent activity to ride the 10-step ladder. Same r30 + trades-count
+ * logic as the live classifier; produces a history so we can ask "how many
+ * consecutive days has this series been parked at the 1¢ floor?"
+ */
+export function backtestThreePoint(
+  allMatchedTrades: MatchedTrade[],
+): Map<string, ThreePointBacktest> {
+  const bySeries = new Map<string, MatchedTrade[]>();
+  for (const t of allMatchedTrades) {
+    const { series } = parseTickerComponents(t.Ticker);
+    if (!bySeries.has(series)) bySeries.set(series, []);
+    bySeries.get(series)!.push(t);
+  }
+
+  const result = new Map<string, ThreePointBacktest>();
+  const today = startOfDay(new Date());
+
+  bySeries.forEach((trades, series) => {
+    const sorted = [...trades].sort((a, b) => a.Exit_Date.getTime() - b.Exit_Date.getTime());
+    const firstTradeDay = startOfDay(sorted[0].Exit_Date);
+    const tradeDays = sorted.map(t => startOfDay(t.Exit_Date));
+    const totalDays = daysBetween(firstTradeDay, today);
+
+    const history: ThreePointSnapshot[] = [];
+    let leftIdx = 0;
+    let rightIdx = 0;
+    let sumPnl = 0;
+    let sumCost = 0;
+    let cumulativeTrades = 0;
+
+    for (let dayIdx = 0; dayIdx <= totalDays; dayIdx++) {
+      const cursor = addDays(firstTradeDay, dayIdx);
+      const windowStart = addDays(cursor, -29);
+
+      const rightIdxBefore = rightIdx;
+      while (rightIdx < sorted.length && tradeDays[rightIdx].getTime() <= cursor.getTime()) {
+        sumPnl += sorted[rightIdx].Net_Profit;
+        sumCost += sorted[rightIdx].Entry_Cost;
+        rightIdx++;
+      }
+      const tradesToday = rightIdx - rightIdxBefore;
+      cumulativeTrades += tradesToday;
+
+      while (leftIdx < rightIdx && tradeDays[leftIdx].getTime() < windowStart.getTime()) {
+        sumPnl -= sorted[leftIdx].Net_Profit;
+        sumCost -= sorted[leftIdx].Entry_Cost;
+        leftIdx++;
+      }
+
+      const r30 = sumCost > 0 ? sumPnl / sumCost : null;
+      const tier = threePointTier(r30, cumulativeTrades);
+
+      history.push({
+        date: dateKey(cursor),
+        tier,
+        r30,
+        cumulativeTrades,
+        tradesToday,
+      });
+    }
+
+    const lastSnap = history[history.length - 1];
+    result.set(series, {
+      series,
+      firstTradeDate: dateKey(firstTradeDay),
+      currentTier: lastSnap ? lastSnap.tier : 100,
+      totalTrades: sorted.length,
+      daysTracked: history.length,
+      lastR30: lastSnap ? lastSnap.r30 : null,
+      history,
+    });
+  });
+
+  return result;
+}
+
+/**
+ * Count consecutive days the series has been parked at `floor` ending today.
+ * Walks history backward; stops at the first non-floor day.
+ */
+export function consecutiveDaysAtFloor(
+  history: { tier: number }[],
+  floor: number = 1,
+): number {
+  let n = 0;
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].tier === floor) n++;
+    else break;
+  }
+  return n;
+}
+
 /**
  * Summarize how many series landed at each tier.
  */
