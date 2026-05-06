@@ -32,9 +32,18 @@ const calculateRiskMetrics = (matchedTrades: MatchedTrade[], initialCapital: num
     };
   }
 
-  // Get date range
-  const startDate = new Date(Math.min(...matchedTrades.map(t => t.Entry_Date.getTime())));
-  const endDate = new Date(Math.max(...matchedTrades.map(t => t.Exit_Date.getTime())));
+  // Get date range — reduce instead of spread; spread overflows the call stack
+  // once matchedTrades grows beyond ~100k rows.
+  let minEntry = Infinity;
+  let maxExit = -Infinity;
+  for (const t of matchedTrades) {
+    const e = t.Entry_Date.getTime();
+    const x = t.Exit_Date.getTime();
+    if (e < minEntry) minEntry = e;
+    if (x > maxExit) maxExit = x;
+  }
+  const startDate = new Date(minEntry);
+  const endDate = new Date(maxExit);
   
   // Create daily portfolio value tracking
   const portfolioValues: { [key: string]: number } = {};
