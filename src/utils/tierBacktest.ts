@@ -1,6 +1,6 @@
 import { MatchedTrade, parseTickerComponents } from './processData';
 
-export const TIER_LADDER = [1, 10, 25, 50, 75, 100, 125, 150, 175, 200, 225, 250] as const;
+export const TIER_LADDER = [1, 10, 25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300] as const;
 export type Tier = typeof TIER_LADDER[number];
 
 export const RECENT_ACTIVITY_WINDOW = 14;
@@ -73,7 +73,7 @@ function ladderDown(tier: number): number {
  *   - Day 4+: r30 ≥ 0 three active days running → +1 level, counter resets
  *            r30 < 0 any calendar day → -1 level, counter resets
  *            r30 null → hold
- *   - Clamped to ladder bounds [1, 200]
+ *   - Clamped to ladder bounds [1, 300]
  */
 export function backtestTiers(
   allMatchedTrades: MatchedTrade[],
