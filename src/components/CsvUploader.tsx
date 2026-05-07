@@ -1,8 +1,27 @@
 'use client';
 
 import { useState, useRef, useMemo } from 'react';
-import Papa from 'papaparse';
-import { processCSVData, ProcessedData, combineProcessedData, filterTradesBySeries, Trade, MatchedTrade, fetchSeriesMetadata, fetchMarketSettlements, parseTickerComponents, SettlementResult } from '@/utils/processData';
+import { ProcessedData, combineProcessedData, filterTradesBySeries, Trade, MatchedTrade, fetchSeriesMetadata, fetchMarketSettlements, parseTickerComponents, SettlementResult } from '@/utils/processData';
+
+// Process a single CSV file in a Web Worker so the UI stays responsive on
+// large files. Returns the same ProcessedData shape the previous inline path
+// produced.
+const processCsvInWorker = (file: File): Promise<ProcessedData> =>
+  new Promise((resolve, reject) => {
+    const worker = new Worker(
+      new URL('../workers/processCsv.worker.ts', import.meta.url)
+    );
+    worker.onmessage = (e: MessageEvent<{ ok: true; data: ProcessedData } | { ok: false; error: string }>) => {
+      if (e.data.ok) resolve(e.data.data);
+      else reject(new Error(e.data.error));
+      worker.terminate();
+    };
+    worker.onerror = (err) => {
+      reject(err.error || new Error(err.message || 'CSV worker failed'));
+      worker.terminate();
+    };
+    worker.postMessage({ file });
+  });
 import Overview from '@/components/Overview';
 import SettlementWhatIf from './SettlementWhatIf';
 import PnlChart from './PnlChart';
@@ -259,25 +278,16 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
 
       const processedDataArray: ProcessedData[] = [];
 
-      // Process each file
+      // Process each file in a Web Worker (keeps UI responsive on large CSVs).
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        
-        // Skip if file was already processed
+
         if (uploadedFiles.includes(file.name)) {
           continue;
         }
 
-        const results = await new Promise((resolve, reject) => {
-          Papa.parse(file, {
-            header: true,
-            complete: resolve,
-            error: reject,
-          });
-        });
-
         try {
-          const processed = processCSVData(results);
+          const processed = await processCsvInWorker(file);
           processedDataArray.push(processed);
           setUploadedFiles(prev => [...prev, file.name]);
         } catch (err) {
