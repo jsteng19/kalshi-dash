@@ -32,6 +32,7 @@ import RiskAdjustedReturns from './RiskAdjustedReturns';
 import TradeList from './TradeList';
 import SeriesStatsTable from './SeriesStatsTable';
 import CategoryStatsTable from './CategoryStatsTable';
+import LazyMount from './LazyMount';
 import TradeNarrative from './TradeNarrative';
 import DailyPnlTable from './DailyPnlTable';
 import MonthlyPnlTable from './MonthlyPnlTable';
@@ -214,6 +215,32 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
     }
     return trades;
   }, [processedData, selectedCategories, categoryMap, seriesFilterUpper, selectedSeries]);
+
+  // Trades for SeriesStatsTable: date + category + series name filter applied,
+  // but NOT selectedSeries (so all series remain visible for selection).
+  const seriesTableTrades = useMemo(() => {
+    if (!processedData) return [];
+    let trades = processedData.matchedTrades;
+    if (selectedMonths.size > 0 || selectedDays.size > 0) {
+      trades = trades.filter(t => matchesDateFilter(t.Exit_Date));
+    }
+    if (selectedCategories.size > 0 && categoryMap.size > 0) {
+      trades = trades.filter(t => {
+        const { series } = parseTickerComponents(t.Ticker);
+        return selectedCategories.has(categoryMap.get(series) || 'Uncategorized');
+      });
+    }
+    if (seriesFilterUpper) {
+      trades = trades.filter(t => {
+        const { series } = parseTickerComponents(t.Ticker);
+        return series.toUpperCase().includes(seriesFilterUpper);
+      });
+    }
+    return trades;
+    // matchesDateFilter closes over selectedMonths/selectedDays which are
+    // already deps, so it's covered transitively.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [processedData, selectedMonths, selectedDays, selectedCategories, categoryMap, seriesFilterUpper]);
 
   // Last 30 days of trades, filtered by category/series name but NOT user date selection
   // Used for the trailing 30d avg return column in SeriesStatsTable
@@ -456,9 +483,11 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
             matchedTrades={filteredData.matchedTrades}
           />
 
-          <RiskAdjustedReturns
-            matchedTrades={filteredData.matchedTrades}
-          />
+          <LazyMount minHeight={520}>
+            <RiskAdjustedReturns
+              matchedTrades={filteredData.matchedTrades}
+            />
+          </LazyMount>
 
           <SettlementWhatIf
             matchedTrades={filteredData.matchedTrades}
@@ -467,11 +496,13 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
             progress={settlementProgress}
           />
 
-          <TradeNarrative
-            matchedTrades={processedData!.matchedTrades}
-            basicStats={processedData!.basicStats}
-            categoryMap={categoryMap}
-          />
+          <LazyMount minHeight={300}>
+            <TradeNarrative
+              matchedTrades={processedData!.matchedTrades}
+              basicStats={processedData!.basicStats}
+              categoryMap={categoryMap}
+            />
+          </LazyMount>
 
           <MonthlyPnlTable
             matchedTrades={nonDateFilteredTrades}
@@ -544,68 +575,52 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
             />
           )}
 
-          <SeriesStatsTable
-            recentMatchedTrades={recentMatchedTrades}
-            allMatchedTrades={processedData!.matchedTrades}
-            matchedTrades={(() => {
-              // Filter by date + category + series name filter, but NOT selected series
-              // (so all series remain visible for selection)
-              let trades = processedData!.matchedTrades;
-              if (selectedMonths.size > 0 || selectedDays.size > 0) {
-                trades = trades.filter(t => matchesDateFilter(t.Exit_Date));
-              }
-              if (selectedCategories.size > 0 && categoryMap.size > 0) {
-                trades = trades.filter(t => {
-                  const { series } = parseTickerComponents(t.Ticker);
-                  return selectedCategories.has(categoryMap.get(series) || 'Uncategorized');
-                });
-              }
-              if (seriesFilterUpper) {
-                trades = trades.filter(t => {
-                  const { series } = parseTickerComponents(t.Ticker);
-                  return series.toUpperCase().includes(seriesFilterUpper);
-                });
-              }
-              return trades;
-            })()}
-            selectedSeries={selectedSeries}
-            onSeriesSelect={setSelectedSeries}
-            frequencyMap={frequencyMap}
-            categoryMap={categoryMap}
-            settlementMap={settlementMap}
-            seriesFilter={seriesFilter}
-            onSeriesFilterChange={(val) => {
-              setSeriesFilter(val);
-              setSelectedSeries(null);
-            }}
-          />
+          <LazyMount minHeight={640} forceMountKey={selectedSeries || seriesFilter || (selectedCategories.size > 0 ? Array.from(selectedCategories).join(',') : null)}>
+            <SeriesStatsTable
+              recentMatchedTrades={recentMatchedTrades}
+              allMatchedTrades={processedData!.matchedTrades}
+              matchedTrades={seriesTableTrades}
+              selectedSeries={selectedSeries}
+              onSeriesSelect={setSelectedSeries}
+              frequencyMap={frequencyMap}
+              categoryMap={categoryMap}
+              settlementMap={settlementMap}
+              seriesFilter={seriesFilter}
+              onSeriesFilterChange={(val) => {
+                setSeriesFilter(val);
+                setSelectedSeries(null);
+              }}
+            />
+          </LazyMount>
           
-          <div className="mt-6">
-            <h2 className="text-xl font-semibold mb-4 text-center">Trading Distributions</h2>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              <div className="bg-white shadow rounded-lg p-6">
-                <h3 className="text-lg font-medium text-gray-700 mb-4 text-center">Trade Direction</h3>
-                <div className="h-[300px] w-full">
-                  <TradeDirectionPie 
-                    yesCount={filteredData.basicStats.yesNoBreakdown.Yes} 
-                    noCount={filteredData.basicStats.yesNoBreakdown.No} 
-                  />
+          <LazyMount minHeight={400}>
+            <div className="mt-6">
+              <h2 className="text-xl font-semibold mb-4 text-center">Trading Distributions</h2>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="bg-white shadow rounded-lg p-6">
+                  <h3 className="text-lg font-medium text-gray-700 mb-4 text-center">Trade Direction</h3>
+                  <div className="h-[300px] w-full">
+                    <TradeDirectionPie
+                      yesCount={filteredData.basicStats.yesNoBreakdown.Yes}
+                      noCount={filteredData.basicStats.yesNoBreakdown.No}
+                    />
+                  </div>
                 </div>
-              </div>
-              <div className="bg-white shadow rounded-lg p-6">
-                <h3 className="text-lg font-medium text-gray-700 mb-4 text-center">Settlement vs Exit</h3>
-                <div className="h-[300px] w-full">
-                  <TradeSettlementPie matchedTrades={filteredData.matchedTrades} />
+                <div className="bg-white shadow rounded-lg p-6">
+                  <h3 className="text-lg font-medium text-gray-700 mb-4 text-center">Settlement vs Exit</h3>
+                  <div className="h-[300px] w-full">
+                    <TradeSettlementPie matchedTrades={filteredData.matchedTrades} />
+                  </div>
                 </div>
-              </div>
-              <div className="bg-white shadow rounded-lg p-6">
-                <h3 className="text-lg font-medium text-gray-700 mb-4 text-center">Maker vs Taker</h3>
-                <div className="h-[300px] w-full">
-                  <MakerTakerPie matchedTrades={filteredData.matchedTrades} />
+                <div className="bg-white shadow rounded-lg p-6">
+                  <h3 className="text-lg font-medium text-gray-700 mb-4 text-center">Maker vs Taker</h3>
+                  <div className="h-[300px] w-full">
+                    <MakerTakerPie matchedTrades={filteredData.matchedTrades} />
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
+          </LazyMount>
           
           {(selectedSeries || selectedCategories.size > 0 || seriesFilter || selectedMonths.size > 0 || selectedDays.size > 0) && <TradeList trades={filteredData.matchedTrades} />}
         </div>
