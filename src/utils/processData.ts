@@ -261,29 +261,40 @@ export const calculateCategoryStatsFromMatched = (
 
 // ============ TICKER/SERIES UTILITIES ============
 
+// Module-level cache. Filtering 126k trades calls this per row per pass;
+// caching the split keeps it ~free after the first hit.
+const _tickerCache = new Map<string, TickerComponents>();
+
 export const parseTickerComponents = (ticker: string): TickerComponents => {
+  const cached = _tickerCache.get(ticker);
+  if (cached) return cached;
+
   const parts = ticker.split('-');
+  let result: TickerComponents;
   if (parts.length >= 3) {
     // Standard format: SERIES-EVENT-MARKET
-    return {
+    result = {
       series: parts[0],
       event: parts[1],
       market: parts.slice(2).join('-'), // Market might have dashes
     };
   } else if (parts.length === 2) {
     // Some tickers might be SERIES-MARKET with no event
-    return {
+    result = {
       series: parts[0],
       event: '',
       market: parts[1],
     };
+  } else {
+    // Fallback for non-standard tickers
+    result = {
+      series: ticker,
+      event: '',
+      market: '',
+    };
   }
-  // Fallback for non-standard tickers
-  return {
-    series: ticker,
-    event: '',
-    market: '',
-  };
+  _tickerCache.set(ticker, result);
+  return result;
 };
 
 // Calculate series stats from MatchedTrades (works for both CSV formats)
