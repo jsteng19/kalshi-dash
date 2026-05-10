@@ -222,7 +222,10 @@ export function generateSqlBody({
   if (toDelete.length) {
     parts.push(
       `-- Inactive series (no trades in 60+ days) — ${toDelete.length} series\n` +
-      `DELETE FROM one_cent_series_filters\nWHERE series_ticker IN (\n  ${toIn(toDelete)}\n);`
+      `-- Row-age guard (created_at < 60d ago) protects rows freshly re-added by\n` +
+      `-- the discovery cron; they need 60 days to attempt their first trade\n` +
+      `-- before sweep eligibility. Symmetric with the 60-day no-trades rule.\n` +
+      `DELETE FROM one_cent_series_filters\nWHERE series_ticker IN (\n  ${toIn(toDelete)}\n)\nAND created_at < NOW() - INTERVAL 60 DAY;`
     );
   }
 
