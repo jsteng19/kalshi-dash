@@ -3,11 +3,11 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
-  // Conditionally apply settings for production build (GitHub Pages)
-  ...(process.env.NODE_ENV === 'production' ? {
-    output: 'export',
-    basePath: '/kalshi-dash',
-  } : {})
+  // NOTE: This app intentionally runs as a Node Next.js server (not a
+  // static export). The tier-history persistence layer at
+  // `/api/tier-history/*` uses better-sqlite3 and only works with Node
+  // route handlers — a static export would silently drop the API routes.
+  // Use `npm run dev` or `npm run build && npm start` for local use.
 };
 
-module.exports = nextConfig; 
+module.exports = nextConfig;

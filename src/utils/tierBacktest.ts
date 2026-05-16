@@ -6,11 +6,50 @@ export type Tier = typeof TIER_LADDER[number];
 export const RECENT_ACTIVITY_WINDOW = 14;
 export const RECENT_ACTIVITY_THRESHOLD = 5;
 
+export const PROMOTE_CONSECUTIVE_REQUIRED = 3;
+export const STARTER_DAYS = 3;
+
+// Demote signal selection thresholds. The active window is whichever has
+// enough trades to be statistically meaningful; falls back to longer windows
+// for low-frequency series.
+export const N_TRADES_FOR_R10 = 30;
+export const N_TRADES_FOR_R15 = 10;
+
+/**
+ * Entry tier when a series first appears. Frequency-aware:
+ *   - daily / weekly / sub-day  → rung 2 (10¢ / 10 contracts)
+ *   - monthly / annual / one_off / custom → rung 4 (50¢)
+ *   - unknown → rung 2 (safer default)
+ */
+export function entryTierFor(frequency: string | undefined): number {
+  switch (frequency) {
+    case 'fifteen_min':
+    case 'hourly':
+    case 'daily':
+    case 'weekly':
+      return 10;
+    case 'monthly':
+    case 'annual':
+    case 'one_off':
+    case 'custom':
+      return 50;
+    default:
+      return 10;
+  }
+}
+
+export type DemoteSignalLabel = 'r10' | 'r15' | 'r35';
+
 export interface TierSnapshot {
-  date: string; // YYYY-MM-DD
+  date: string;
   tier: number;
   prevTier: number;
+  r10: number | null;
+  r15: number | null;
+  r35: number | null;
+  // r30 retained for promote signal + display
   r30: number | null;
+  signal: DemoteSignalLabel | null;
   consecutivePositive: number;
   moved: 'up' | 'down' | null;
   tradesToday: number;
@@ -20,11 +59,14 @@ export interface TierSnapshot {
 export interface SeriesBacktest {
   series: string;
   frequency: string;
+  entryTier: number;
   firstTradeDate: string;
   currentTier: number;
   totalTrades: number;
   daysTracked: number;
   lastR30: number | null;
+  lastDemoteSignal: number | null;
+  lastSignalLabel: DemoteSignalLabel | null;
   recentActivityDays: number;
   history: TierSnapshot[];
 }
@@ -65,20 +107,75 @@ function ladderDown(tier: number): number {
 }
 
 /**
- * Backtest series that are recently active (≥5 trading days in last 14 calendar days)
- * through the 10-step ladder. No frequency labels needed — activity determines routing.
+ * Sliding-window cost-weighted return helper.
+ * Maintains (sumPnl / sumCost) over [windowStart, cursor] day-inclusive.
+ */
+class SlidingWindow {
+  private leftIdx = 0;
+  private rightIdx = 0;
+  private sumPnl = 0;
+  private sumCost = 0;
+  private count = 0;
+
+  constructor(
+    private readonly sortedTrades: MatchedTrade[],
+    private readonly tradeDays: Date[],
+    private readonly windowDays: number,
+  ) {}
+
+  advanceTo(cursor: Date): { r: number | null; n: number } {
+    const windowStart = addDays(cursor, -(this.windowDays - 1));
+    while (this.rightIdx < this.sortedTrades.length
+        && this.tradeDays[this.rightIdx].getTime() <= cursor.getTime()) {
+      this.sumPnl += this.sortedTrades[this.rightIdx].Net_Profit;
+      this.sumCost += this.sortedTrades[this.rightIdx].Entry_Cost;
+      this.count += 1;
+      this.rightIdx += 1;
+    }
+    while (this.leftIdx < this.rightIdx
+        && this.tradeDays[this.leftIdx].getTime() < windowStart.getTime()) {
+      this.sumPnl -= this.sortedTrades[this.leftIdx].Net_Profit;
+      this.sumCost -= this.sortedTrades[this.leftIdx].Entry_Cost;
+      this.count -= 1;
+      this.leftIdx += 1;
+    }
+    const r = this.sumCost > 0 ? this.sumPnl / this.sumCost : null;
+    return { r, n: this.count };
+  }
+}
+
+function pickDemoteSignal(
+  r10: number | null, n10: number,
+  r15: number | null, n15: number,
+  r35: number | null,
+): { value: number | null; label: DemoteSignalLabel | null } {
+  if (n10 >= N_TRADES_FOR_R10 && r10 !== null) return { value: r10, label: 'r10' };
+  if (n15 >= N_TRADES_FOR_R15 && r15 !== null) return { value: r15, label: 'r15' };
+  if (r35 !== null) return { value: r35, label: 'r35' };
+  return { value: null, label: null };
+}
+
+/**
+ * Backtest series through the 10-step ladder using frequency-aware entry
+ * tier + hybrid demote signal (r10 high-volume dailies / r15 weeklies /
+ * r35 monthlies+). Promote still uses r30 for stability.
  *
  * Rules:
- *   - Starter: days 1–3 pinned at 1¢, counter still accumulates
- *   - Day 4+: r30 ≥ 0 three active days running → +1 level, counter resets
- *            r30 < 0 any calendar day → -1 level, counter resets
- *            r30 null → hold
- *   - Clamped to ladder bounds [1, 200] — capped at 200 because per-size
- *     ROI analysis shows the 200+ bucket runs net-negative (-12.5%)
- *     while 11-200 stays positive. Don't bleed money chasing capacity.
+ *   - Starter (days 1..STARTER_DAYS): pinned at entryTier(frequency).
+ *     Accumulate consecutive-positive counter using r30.
+ *   - Day STARTER_DAYS+1 onward:
+ *       demoteSignal < 0 → -1 step, counter resets
+ *       active AND r30 ≥ 0 AND counter+1 ≥ PROMOTE_CONSECUTIVE_REQUIRED → +1 step, counter resets
+ *       active AND r30 ≥ 0 (counter not yet 3) → counter += 1, hold
+ *       else → hold
+ *   - Clamped to [1, 200].
+ *   - Only series with ≥RECENT_ACTIVITY_THRESHOLD trade days in the last
+ *     RECENT_ACTIVITY_WINDOW are returned (others are dormant; caller
+ *     handles them separately).
  */
 export function backtestTiers(
   allMatchedTrades: MatchedTrade[],
+  frequencyMap: Map<string, string> = new Map(),
 ): Map<string, SeriesBacktest> {
   const bySeries = new Map<string, MatchedTrade[]>();
   for (const t of allMatchedTrades) {
@@ -95,7 +192,6 @@ export function backtestTiers(
     const firstTradeDay = startOfDay(sorted[0].Exit_Date);
     const tradeDays = sorted.map(t => startOfDay(t.Exit_Date));
 
-    // Count distinct trading days in the recent activity window
     const recentCutoff = addDays(today, -(RECENT_ACTIVITY_WINDOW - 1));
     const recentTradeDates = new Set<string>();
     for (const td of tradeDays) {
@@ -104,55 +200,55 @@ export function backtestTiers(
       }
     }
     const recentActivityDays = recentTradeDates.size;
-
     if (recentActivityDays < RECENT_ACTIVITY_THRESHOLD) return;
 
     const totalDays = daysBetween(firstTradeDay, today);
+    const freq = frequencyMap.get(series) ?? 'unknown';
+    const entryTier = entryTierFor(freq);
 
-    let tier = 1;
+    let tier = entryTier;
     let consecutive = 0;
     const history: TierSnapshot[] = [];
 
-    let leftIdx = 0;
-    let rightIdx = 0;
-    let sumPnl = 0;
-    let sumCost = 0;
+    const w10 = new SlidingWindow(sorted, tradeDays, 10);
+    const w15 = new SlidingWindow(sorted, tradeDays, 15);
+    const w30 = new SlidingWindow(sorted, tradeDays, 30);
+    const w35 = new SlidingWindow(sorted, tradeDays, 35);
 
+    let rightIdxLast = 0;
     for (let dayIdx = 0; dayIdx <= totalDays; dayIdx++) {
       const cursor = addDays(firstTradeDay, dayIdx);
-      const windowStart = addDays(cursor, -29);
 
-      const rightIdxBefore = rightIdx;
-      while (rightIdx < sorted.length && tradeDays[rightIdx].getTime() <= cursor.getTime()) {
-        sumPnl += sorted[rightIdx].Net_Profit;
-        sumCost += sorted[rightIdx].Entry_Cost;
-        rightIdx++;
-      }
-      const tradesToday = rightIdx - rightIdxBefore;
-      while (leftIdx < rightIdx && tradeDays[leftIdx].getTime() < windowStart.getTime()) {
-        sumPnl -= sorted[leftIdx].Net_Profit;
-        sumCost -= sorted[leftIdx].Entry_Cost;
-        leftIdx++;
-      }
+      const { r: r10, n: n10 } = w10.advanceTo(cursor);
+      const { r: r15, n: n15 } = w15.advanceTo(cursor);
+      const { r: r30 } = w30.advanceTo(cursor);
+      const { r: r35 } = w35.advanceTo(cursor);
 
-      const r30 = sumCost > 0 ? sumPnl / sumCost : null;
+      // tradesToday derived from how many trades fall on this exact day
+      let tradesToday = 0;
+      while (rightIdxLast < sorted.length
+          && tradeDays[rightIdxLast].getTime() <= cursor.getTime()) {
+        if (tradeDays[rightIdxLast].getTime() === cursor.getTime()) tradesToday += 1;
+        rightIdxLast += 1;
+      }
       const active = tradesToday > 0;
+
+      const { value: demoteSig, label: signalLabel } = pickDemoteSignal(r10, n10, r15, n15, r35);
 
       let moved: 'up' | 'down' | null = null;
       const prevTier = tier;
 
-      if (dayIdx < 3) {
-        if (active && r30 !== null) {
-          if (r30 >= 0) consecutive += 1;
-          else consecutive = 0;
-        }
+      if (dayIdx < STARTER_DAYS) {
+        // Pinned at entry tier; accumulate counter for post-starter promote.
+        if (active && r30 !== null && r30 >= 0) consecutive += 1;
+        else if (demoteSig !== null && demoteSig < 0) consecutive = 0;
       } else {
-        if (r30 !== null && r30 < 0) {
+        if (demoteSig !== null && demoteSig < 0) {
           tier = ladderDown(tier);
           consecutive = 0;
         } else if (active && r30 !== null && r30 >= 0) {
           consecutive += 1;
-          if (consecutive >= 3) {
+          if (consecutive >= PROMOTE_CONSECUTIVE_REQUIRED) {
             tier = ladderUp(tier);
             consecutive = 0;
           }
@@ -166,7 +262,8 @@ export function backtestTiers(
         date: dateKey(cursor),
         tier,
         prevTier,
-        r30,
+        r10, r15, r30, r35,
+        signal: signalLabel,
         consecutivePositive: consecutive,
         moved,
         tradesToday,
@@ -175,117 +272,25 @@ export function backtestTiers(
     }
 
     const lastSnap = history[history.length - 1];
+    const lastSignalValue = lastSnap
+      ? (lastSnap.signal === 'r10' ? lastSnap.r10
+         : lastSnap.signal === 'r15' ? lastSnap.r15
+         : lastSnap.signal === 'r35' ? lastSnap.r35
+         : null)
+      : null;
+
     result.set(series, {
       series,
-      frequency: 'ladder',
+      frequency: freq,
+      entryTier,
       firstTradeDate: dateKey(firstTradeDay),
       currentTier: tier,
       totalTrades: sorted.length,
       daysTracked: history.length,
       lastR30: lastSnap ? lastSnap.r30 : null,
+      lastDemoteSignal: lastSignalValue,
+      lastSignalLabel: lastSnap?.signal ?? null,
       recentActivityDays,
-      history,
-    });
-  });
-
-  return result;
-}
-
-export interface ThreePointSnapshot {
-  date: string;
-  tier: 1 | 100 | 200;
-  r30: number | null;
-  cumulativeTrades: number;
-  tradesToday: number;
-}
-
-export interface ThreePointBacktest {
-  series: string;
-  firstTradeDate: string;
-  currentTier: 1 | 100 | 200;
-  totalTrades: number;
-  daysTracked: number;
-  lastR30: number | null;
-  history: ThreePointSnapshot[];
-}
-
-function threePointTier(r30: number | null, tradesCount: number): 1 | 100 | 200 {
-  if (r30 !== null && r30 >= 0 && tradesCount >= 2) return 200;
-  if (r30 !== null && r30 < 0 && tradesCount >= 2) return 1;
-  return 100;
-}
-
-/**
- * Backtest 3-point tier (1 / 100 / 200) per day for series that don't have
- * enough recent activity to ride the 10-step ladder. Same r30 + trades-count
- * logic as the live classifier; produces a history so we can ask "how many
- * consecutive days has this series been parked at the 1¢ floor?"
- */
-export function backtestThreePoint(
-  allMatchedTrades: MatchedTrade[],
-): Map<string, ThreePointBacktest> {
-  const bySeries = new Map<string, MatchedTrade[]>();
-  for (const t of allMatchedTrades) {
-    const { series } = parseTickerComponents(t.Ticker);
-    if (!bySeries.has(series)) bySeries.set(series, []);
-    bySeries.get(series)!.push(t);
-  }
-
-  const result = new Map<string, ThreePointBacktest>();
-  const today = startOfDay(new Date());
-
-  bySeries.forEach((trades, series) => {
-    const sorted = [...trades].sort((a, b) => a.Exit_Date.getTime() - b.Exit_Date.getTime());
-    const firstTradeDay = startOfDay(sorted[0].Exit_Date);
-    const tradeDays = sorted.map(t => startOfDay(t.Exit_Date));
-    const totalDays = daysBetween(firstTradeDay, today);
-
-    const history: ThreePointSnapshot[] = [];
-    let leftIdx = 0;
-    let rightIdx = 0;
-    let sumPnl = 0;
-    let sumCost = 0;
-    let cumulativeTrades = 0;
-
-    for (let dayIdx = 0; dayIdx <= totalDays; dayIdx++) {
-      const cursor = addDays(firstTradeDay, dayIdx);
-      const windowStart = addDays(cursor, -29);
-
-      const rightIdxBefore = rightIdx;
-      while (rightIdx < sorted.length && tradeDays[rightIdx].getTime() <= cursor.getTime()) {
-        sumPnl += sorted[rightIdx].Net_Profit;
-        sumCost += sorted[rightIdx].Entry_Cost;
-        rightIdx++;
-      }
-      const tradesToday = rightIdx - rightIdxBefore;
-      cumulativeTrades += tradesToday;
-
-      while (leftIdx < rightIdx && tradeDays[leftIdx].getTime() < windowStart.getTime()) {
-        sumPnl -= sorted[leftIdx].Net_Profit;
-        sumCost -= sorted[leftIdx].Entry_Cost;
-        leftIdx++;
-      }
-
-      const r30 = sumCost > 0 ? sumPnl / sumCost : null;
-      const tier = threePointTier(r30, cumulativeTrades);
-
-      history.push({
-        date: dateKey(cursor),
-        tier,
-        r30,
-        cumulativeTrades,
-        tradesToday,
-      });
-    }
-
-    const lastSnap = history[history.length - 1];
-    result.set(series, {
-      series,
-      firstTradeDate: dateKey(firstTradeDay),
-      currentTier: lastSnap ? lastSnap.tier : 100,
-      totalTrades: sorted.length,
-      daysTracked: history.length,
-      lastR30: lastSnap ? lastSnap.r30 : null,
       history,
     });
   });
@@ -295,7 +300,6 @@ export function backtestThreePoint(
 
 /**
  * Count consecutive days the series has been parked at `floor` ending today.
- * Walks history backward; stops at the first non-floor day.
  */
 export function consecutiveDaysAtFloor(
   history: { tier: number }[],
@@ -307,6 +311,21 @@ export function consecutiveDaysAtFloor(
     else break;
   }
   return n;
+}
+
+/**
+ * Days since the most recent promote in history (null if never promoted).
+ */
+export function daysSinceLastPromote(history: TierSnapshot[]): number | null {
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].moved === 'up') {
+      const lastDate = new Date(history[i].date + 'T00:00:00');
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const today = new Date(todayStr + 'T00:00:00');
+      return Math.round((today.getTime() - lastDate.getTime()) / (1000 * 60 * 60 * 24));
+    }
+  }
+  return null;
 }
 
 /**

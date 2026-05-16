@@ -2,7 +2,8 @@
 
 import React, { useMemo, useState, useDeferredValue } from 'react';
 import { MatchedTrade, calculateSeriesStatsFromMatched, parseTickerComponents, SettlementResult } from '@/utils/processData';
-import { backtestTiers, backtestThreePoint, consecutiveDaysAtFloor, summarizeTierDistribution, TIER_LADDER, RECENT_ACTIVITY_WINDOW, RECENT_ACTIVITY_THRESHOLD, SeriesBacktest } from '@/utils/tierBacktest';
+import { backtestTiers, consecutiveDaysAtFloor, summarizeTierDistribution, TIER_LADDER, RECENT_ACTIVITY_WINDOW, RECENT_ACTIVITY_THRESHOLD, SeriesBacktest } from '@/utils/tierBacktest';
+import { bucketByPositionSize, PositionSizeBucketStats, PositionSizeRange } from '@/utils/positionSizeAnalysis';
 
 interface SeriesStatsTableProps {
   matchedTrades: MatchedTrade[];
@@ -19,7 +20,8 @@ interface SeriesStatsTableProps {
 
 type SortField = 'series' | 'pnl' | 'proceeds' | 'cost' | 'fees' | 'trades' | 'winRate' | 'avgReturn' | 'trailing30d';
 type SortDirection = 'asc' | 'desc';
-type BacktestSortField = 'series' | 'activity' | 'firstTrade' | 'days' | 'trades' | 'currentTier' | 'lastR30';
+type BacktestSortField = 'series' | 'activity' | 'firstTrade' | 'days' | 'trades' | 'currentTier' | 'lastR30' | 'signal' | 'status';
+type PosSizeSortField = 'bucket' | 'trades' | 'distinctSeries' | 'totalCost' | 'totalPnl' | 'totalFees' | 'roi' | 'winRate' | 'firstUsed' | 'lastUsed';
 
 export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, allMatchedTrades, frequencyMap, categoryMap, settlementMap, selectedSeries, onSeriesSelect, seriesFilter, onSeriesFilterChange }: SeriesStatsTableProps) {
   const [sortField, setSortField] = useState<SortField>('pnl');
@@ -31,6 +33,58 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
   const [backtestSortField, setBacktestSortField] = useState<BacktestSortField>('currentTier');
   const [backtestSortDirection, setBacktestSortDirection] = useState<SortDirection>('desc');
   const [generatingSQL, setGeneratingSQL] = useState(false);
+  const [posSizeModalOpen, setPosSizeModalOpen] = useState(false);
+  const [posSizeRange, setPosSizeRange] = useState<PositionSizeRange>('all');
+  const [posSizeSortField, setPosSizeSortField] = useState<PosSizeSortField>('bucket');
+  const [posSizeSortDir, setPosSizeSortDir] = useState<SortDirection>('asc');
+
+  const handlePosSizeSort = (field: PosSizeSortField) => {
+    if (posSizeSortField === field) {
+      setPosSizeSortDir(prev => prev === 'asc' ? 'desc' : 'asc');
+    } else {
+      setPosSizeSortField(field);
+      setPosSizeSortDir(field === 'bucket' ? 'asc' : 'desc');
+    }
+  };
+
+  const PosSizeSortIcon = ({ field }: { field: PosSizeSortField }) => {
+    if (posSizeSortField !== field) return <span className="ml-1 text-gray-300">↕</span>;
+    return <span className="ml-1">{posSizeSortDir === 'asc' ? '↑' : '↓'}</span>;
+  };
+
+  const posSizeRows = useMemo<PositionSizeBucketStats[]>(() => {
+    if (!posSizeModalOpen) return [];
+    return bucketByPositionSize(allMatchedTrades, posSizeRange);
+  }, [posSizeModalOpen, posSizeRange, allMatchedTrades]);
+
+  const sortedPosSizeRows = useMemo(() => {
+    const arr = [...posSizeRows];
+    const dir = posSizeSortDir === 'asc' ? 1 : -1;
+    arr.sort((a, b) => {
+      switch (posSizeSortField) {
+        case 'bucket': {
+          const av = a.bucket === '2000+' ? Infinity : a.bucket;
+          const bv = b.bucket === '2000+' ? Infinity : b.bucket;
+          return dir * (av - bv);
+        }
+        case 'trades': return dir * (a.trades - b.trades);
+        case 'distinctSeries': return dir * (a.distinctSeries - b.distinctSeries);
+        case 'totalCost': return dir * (a.totalCost - b.totalCost);
+        case 'totalPnl': return dir * (a.totalPnl - b.totalPnl);
+        case 'totalFees': return dir * (a.totalFees - b.totalFees);
+        case 'roi': {
+          if (a.roi === null && b.roi === null) return 0;
+          if (a.roi === null) return 1;
+          if (b.roi === null) return -1;
+          return dir * (a.roi - b.roi);
+        }
+        case 'winRate': return dir * (a.winRate - b.winRate);
+        case 'firstUsed': return dir * String(a.firstUsed ?? '').localeCompare(String(b.firstUsed ?? ''));
+        case 'lastUsed': return dir * String(a.lastUsed ?? '').localeCompare(String(b.lastUsed ?? ''));
+      }
+    });
+    return arr;
+  }, [posSizeRows, posSizeSortField, posSizeSortDir]);
 
   // Defer heavy props so the table render + filter input stay snappy when the
   // user types. React renders the OLD seriesData immediately, then schedules
@@ -150,11 +204,26 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
     const worker = new Worker(
       new URL('../workers/generateSql.worker.ts', import.meta.url)
     );
-    worker.onmessage = (e: MessageEvent<{ ok: true; sql: string } | { ok: false; error: string }>) => {
+    worker.onmessage = (e: MessageEvent<{ ok: true; sql: string; snapshots: unknown[] } | { ok: false; error: string }>) => {
       setGeneratingSQL(false);
       worker.terminate();
-      if (e.data.ok) setSqlModal(e.data.sql);
-      else console.error('generateSQL worker:', e.data.error);
+      if (e.data.ok) {
+        setSqlModal(e.data.sql);
+        // Persist today's tier snapshot per series. Fire-and-forget — never
+        // block the SQL display on this. Failures are logged but harmless.
+        if (e.data.snapshots && e.data.snapshots.length > 0) {
+          fetch('/api/tier-history/snapshot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ snapshots: e.data.snapshots }),
+          })
+            .then(r => r.json())
+            .then(j => console.log('tier-history persisted:', j))
+            .catch(err => console.warn('tier-history persist failed (non-fatal):', err));
+        }
+      } else {
+        console.error('generateSQL worker:', e.data.error);
+      }
     };
     worker.onerror = (err) => {
       setGeneratingSQL(false);
@@ -179,7 +248,7 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
 
   const runBacktest = () => {
     if (!frequencyMap || !categoryMap) return;
-    const result = backtestTiers(allMatchedTrades);
+    const result = backtestTiers(allMatchedTrades, frequencyMap ?? new Map());
     setBacktestModal(result);
     setBacktestSelectedSeries(null);
   };
@@ -212,6 +281,13 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
                   className={`px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${backtestDisabled ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-purple-600 text-white hover:bg-purple-700'}`}
                 >
                   Run Backtest
+                </button>
+                <button
+                  onClick={() => setPosSizeModalOpen(true)}
+                  title="Lifetime ROI per position size bucket across the entire CSV"
+                  className="px-3 py-1.5 rounded-full text-sm font-medium transition-colors bg-emerald-600 text-white hover:bg-emerald-700"
+                >
+                  Position Size ROI
                 </button>
                 <button
                   onClick={generateSQL}
@@ -338,6 +414,37 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
       </div>
 
       {backtestModal !== null && (() => {
+        // Status priority for sort + badge display. Backtest pushes one
+        // snapshot per calendar day from firstTradeDay to today, so
+        // history[length-1] is always "today" and the prior 3 entries
+        // are yesterday / 2d ago / 3d ago.
+        const recentMove = (bt: SeriesBacktest): 'up' | 'down' | null => {
+          const last = bt.history[bt.history.length - 1];
+          return last?.moved ?? null;
+        };
+        const inPromoteCooldown = (bt: SeriesBacktest): boolean => {
+          const n = bt.history.length;
+          for (let i = n - 1; i >= Math.max(0, n - 3); i--) {
+            if (bt.history[i].moved === 'up') return true;
+          }
+          return false;
+        };
+        const statusRank = (bt: SeriesBacktest): number => {
+          const mv = recentMove(bt);
+          if (mv === 'up') return 0;
+          if (mv === 'down') return 1;
+          if (inPromoteCooldown(bt)) return 2;
+          if (bt.daysTracked <= 3) return 3;
+          return 4;
+        };
+        const statusBadge = (bt: SeriesBacktest): { text: string; cls: string } => {
+          const mv = recentMove(bt);
+          if (mv === 'up')   return { text: '↑ promoted', cls: 'bg-green-100 text-green-700' };
+          if (mv === 'down') return { text: '↓ demoted',  cls: 'bg-red-100 text-red-700' };
+          if (inPromoteCooldown(bt)) return { text: '🔒 cooldown', cls: 'bg-amber-100 text-amber-700' };
+          if (bt.daysTracked <= 3)   return { text: '🆕 starter',  cls: 'bg-blue-100 text-blue-700' };
+          return { text: '', cls: '' };
+        };
         const distribution = summarizeTierDistribution(backtestModal);
         const selected = backtestSelectedSeries ? backtestModal.get(backtestSelectedSeries) : null;
         const allSorted = Array.from(backtestModal.values()).sort((a, b) => {
@@ -357,17 +464,34 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
               if (b.lastR30 === null) return -1;
               return dir * (a.lastR30 - b.lastR30);
             }
+            case 'signal': {
+              const av = a.lastDemoteSignal, bv = b.lastDemoteSignal;
+              if (av === null && bv === null) return 0;
+              if (av === null) return 1;
+              if (bv === null) return -1;
+              return dir * (av - bv);
+            }
+            case 'status': {
+              const sa = statusRank(a), sb = statusRank(b);
+              return dir * (sa - sb);
+            }
           }
         });
         return (
-          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-            <div className="bg-white rounded-xl shadow-2xl w-full max-w-5xl flex flex-col max-h-[85vh]">
+          <div
+            className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+            onClick={() => { setBacktestModal(null); setBacktestSelectedSeries(null); }}
+          >
+            <div
+              className="bg-white rounded-xl shadow-2xl w-full max-w-5xl flex flex-col max-h-[85vh]"
+              onClick={(e) => e.stopPropagation()}
+            >
               <div className="flex items-center justify-between px-6 py-4 border-b">
                 <h3 className="text-lg font-semibold">Ladder Backtest — {backtestModal.size} series</h3>
                 <button onClick={() => { setBacktestModal(null); setBacktestSelectedSeries(null); }} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
               </div>
               <div className="px-6 py-3 border-b bg-gray-50 text-xs text-gray-600">
-                Activity-based: ≥{RECENT_ACTIVITY_THRESHOLD} trading days in last {RECENT_ACTIVITY_WINDOW} → {TIER_LADDER.length}-step ladder ({TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join(' → ')}). 3 consecutive r30 ≥ 0 → +1. Any r30 &lt; 0 → -1. Days 1–3 pinned at 1¢. Others → 3-point (1¢/100¢/200¢).
+                Active series (≥{RECENT_ACTIVITY_THRESHOLD} trade days in last {RECENT_ACTIVITY_WINDOW}d) ride the {TIER_LADDER.length}-step ladder ({TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join(' → ')}). Entry tier by frequency: daily/weekly → 10¢, monthly/annual/one-off → 50¢. Days 1–3 pinned at entry tier. Promote: 3 consecutive r30 ≥ 0 days → +1. Demote: hybrid signal &lt; 0 → -1 (r10 if ≥30 trades/10d, else r15 if ≥10 trades/15d, else r35). Dormant series hold at OCT's current size.
               </div>
               <div className="grid gap-px bg-gray-200 border-b shrink-0" style={{gridTemplateColumns: `repeat(${TIER_LADDER.length}, minmax(0, 1fr))`}}>
                 {distribution.map(d => (
@@ -431,7 +555,9 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
                           <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('days')}>Days<BacktestSortIcon field="days" /></th>
                           <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('trades')}>Trades<BacktestSortIcon field="trades" /></th>
                           <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('currentTier')}>Current Tier<BacktestSortIcon field="currentTier" /></th>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('lastR30')}>Last r30<BacktestSortIcon field="lastR30" /></th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('status')}>Status<BacktestSortIcon field="status" /></th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('signal')}>Demote Signal<BacktestSortIcon field="signal" /></th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('lastR30')}>r30<BacktestSortIcon field="lastR30" /></th>
                         </tr>
                       </thead>
                     </table>
@@ -447,6 +573,12 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
                             <td className="px-3 py-1 text-gray-500">{bt.daysTracked}</td>
                             <td className="px-3 py-1 text-gray-500">{bt.totalTrades}</td>
                             <td className="px-3 py-1 font-semibold">{bt.currentTier === 1 ? '1¢' : `${bt.currentTier}¢`}</td>
+                            <td className="px-3 py-1">
+                              {(() => { const b = statusBadge(bt); return b.text ? <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${b.cls}`}>{b.text}</span> : <span className="text-gray-300">—</span>; })()}
+                            </td>
+                            <td className={`px-3 py-1 ${bt.lastDemoteSignal === null ? 'text-gray-300' : bt.lastDemoteSignal >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                              {bt.lastSignalLabel && bt.lastDemoteSignal !== null ? `${bt.lastSignalLabel} ${formatPercent(bt.lastDemoteSignal)}` : '—'}
+                            </td>
                             <td className={`px-3 py-1 ${bt.lastR30 === null ? 'text-gray-300' : bt.lastR30 >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                               {bt.lastR30 === null ? '—' : formatPercent(bt.lastR30)}
                             </td>
@@ -466,15 +598,21 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
       })()}
 
       {sqlModal !== null && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl flex flex-col max-h-[80vh]">
+        <div
+          className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+          onClick={() => setSqlModal(null)}
+        >
+          <div
+            className="bg-white rounded-xl shadow-2xl w-full max-w-2xl flex flex-col max-h-[80vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="flex items-center justify-between px-6 py-4 border-b">
               <h3 className="text-lg font-semibold">Position Size SQL</h3>
               <button onClick={() => setSqlModal(null)} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
             </div>
             <div className="px-6 py-2 text-xs text-gray-500 border-b bg-gray-50">
-              <span className="font-medium text-gray-700">{TIER_LADDER.length}-step ladder</span> (≥{RECENT_ACTIVITY_THRESHOLD}d/{RECENT_ACTIVITY_WINDOW}d active): {TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join('→')}. Days 1–3 at 1¢; 3 consecutive r30 ≥ 0 days → +1 level, any r30 &lt; 0 → -1 level. &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">3-point</span> (low activity): 200¢ (positive 30d + 2+ trades), 100¢ (insufficient data), 1¢ (negative 30d + 2+ trades). &nbsp;·&nbsp;
+              <span className="font-medium text-gray-700">{TIER_LADDER.length}-step ladder</span> (≥{RECENT_ACTIVITY_THRESHOLD}d/{RECENT_ACTIVITY_WINDOW}d active): {TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join('→')}. Entry tier 10¢ (daily/weekly) / 50¢ (monthly+); days 1–3 pinned at entry. Promote: 3 consecutive r30 ≥ 0 → +1. Demote: hybrid signal &lt; 0 → -1 (r10 if active ≥30 trades/10d, else r15 if ≥10 trades/15d, else r35). &nbsp;·&nbsp;
+              <span className="font-medium text-gray-700">Dormant</span> (low activity): no UPDATE emitted; OCT holds current size. &nbsp;·&nbsp;
               <span className="font-medium text-gray-700">DELETE</span> — no trades in 60+ days. &nbsp;·&nbsp;
               <span className="font-medium text-gray-700">Disabled stinkers</span> — per-frequency thresholds (hourly/daily 30d/30t, weekly 45d/20t, monthly 60d/6t, annual/one_off 90d), all-time negative, parked at 1¢ for 10+ consecutive days, non-weather.
             </div>
@@ -496,6 +634,78 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
               >
                 Close
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {posSizeModalOpen && (
+        <div
+          className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+          onClick={() => setPosSizeModalOpen(false)}
+        >
+          <div
+            className="bg-white rounded-xl shadow-2xl w-full max-w-6xl flex flex-col max-h-[85vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-6 py-4 border-b">
+              <h3 className="text-lg font-semibold">Position Size ROI — closed trades only</h3>
+              <button onClick={() => setPosSizeModalOpen(false)} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+            </div>
+            <div className="px-6 py-3 border-b bg-gray-50 flex items-center gap-2">
+              <span className="text-xs text-gray-500 mr-2">Range:</span>
+              {(['all', '90', '60', '30'] as const).map(r => (
+                <button
+                  key={r}
+                  onClick={() => setPosSizeRange(r)}
+                  className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${posSizeRange === r ? 'bg-emerald-600 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}
+                >
+                  {r === 'all' ? 'Full History' : `Last ${r}d`}
+                </button>
+              ))}
+              <span className="ml-auto text-xs text-gray-500">{sortedPosSizeRows.length} buckets · {sortedPosSizeRows.reduce((s, r) => s + r.trades, 0).toLocaleString()} trades</span>
+            </div>
+            <div className="flex-1 overflow-auto">
+              <table className="min-w-full text-xs">
+                <thead className="bg-gray-50 sticky top-0">
+                  <tr>
+                    <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handlePosSizeSort('bucket')}>Bucket<PosSizeSortIcon field="bucket" /></th>
+                    <th className="px-3 py-2 text-right font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handlePosSizeSort('trades')}>Trades<PosSizeSortIcon field="trades" /></th>
+                    <th className="px-3 py-2 text-right font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handlePosSizeSort('distinctSeries')}>Series<PosSizeSortIcon field="distinctSeries" /></th>
+                    <th className="px-3 py-2 text-right font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handlePosSizeSort('totalCost')}>Cost<PosSizeSortIcon field="totalCost" /></th>
+                    <th className="px-3 py-2 text-right font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handlePosSizeSort('totalPnl')}>Net PnL<PosSizeSortIcon field="totalPnl" /></th>
+                    <th className="px-3 py-2 text-right font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handlePosSizeSort('totalFees')}>Fees<PosSizeSortIcon field="totalFees" /></th>
+                    <th className="px-3 py-2 text-right font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handlePosSizeSort('roi')}>ROI<PosSizeSortIcon field="roi" /></th>
+                    <th className="px-3 py-2 text-right font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handlePosSizeSort('winRate')}>Win %<PosSizeSortIcon field="winRate" /></th>
+                    <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handlePosSizeSort('firstUsed')}>First<PosSizeSortIcon field="firstUsed" /></th>
+                    <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handlePosSizeSort('lastUsed')}>Last<PosSizeSortIcon field="lastUsed" /></th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {sortedPosSizeRows.length === 0 && (
+                    <tr><td colSpan={10} className="px-3 py-8 text-center text-sm text-gray-400">No trades in selected range</td></tr>
+                  )}
+                  {sortedPosSizeRows.map(row => (
+                    <tr key={row.label} className="hover:bg-gray-50">
+                      <td className="px-3 py-2 font-mono font-semibold">{row.label}</td>
+                      <td className="px-3 py-2 text-right">{row.trades.toLocaleString()}</td>
+                      <td className="px-3 py-2 text-right">{row.distinctSeries}</td>
+                      <td className="px-3 py-2 text-right">{formatCurrency(row.totalCost)}</td>
+                      <td className={`px-3 py-2 text-right font-medium ${row.totalPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>{formatCurrency(row.totalPnl)}</td>
+                      <td className="px-3 py-2 text-right text-gray-500">{formatCurrency(row.totalFees)}</td>
+                      <td className={`px-3 py-2 text-right font-semibold ${row.roi === null ? 'text-gray-300' : row.roi >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                        {row.roi === null ? '—' : formatPercent(row.roi)}
+                      </td>
+                      <td className="px-3 py-2 text-right">{formatPercent(row.winRate)}</td>
+                      <td className="px-3 py-2 text-gray-500 font-mono">{row.firstUsed ?? '—'}</td>
+                      <td className="px-3 py-2 text-gray-500 font-mono">{row.lastUsed ?? '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="px-6 py-3 border-t bg-gray-50 text-xs text-gray-500">
+              Bucket = max contracts in tier (e.g. 1–10 contracts → bucket 10). Click any column header to sort. Click outside or press ✕ to close.
             </div>
           </div>
         </div>

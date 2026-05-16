@@ -1,11 +1,22 @@
 /**
  * Pure SQL generation logic — runs in a Worker so the page doesn't freeze
- * on the heavy backtest passes. Mirror of the previous inline generateSQL
- * in SeriesStatsTable; same outputs, same comments format.
+ * on the heavy backtest passes.
+ *
+ * Output: { sql, snapshots }. Caller posts snapshots[] to
+ * /api/tier-history/snapshot for persistence.
+ *
+ * Rules in effect:
+ *   - 10-step ladder is the only classifier (3-point removed).
+ *   - Frequency-aware entry tier (rung 2 dailies/weeklies, rung 4 monthlies+).
+ *   - Hybrid demote signal: r10 / r15 / r35 based on per-series activity.
+ *   - Promote uses r30, 3 consecutive positive days required (implicit
+ *     3-day cooldown between promotes).
+ *   - Demote is single-day, single-step. -1 step per negative day.
  */
 
 import { MatchedTrade, parseTickerComponents, calculateSeriesStatsFromMatched, SettlementResult } from './processData';
-import { backtestTiers, backtestThreePoint, consecutiveDaysAtFloor, TIER_LADDER } from './tierBacktest';
+import { backtestTiers, consecutiveDaysAtFloor, entryTierFor, TIER_LADDER, SeriesBacktest, DemoteSignalLabel } from './tierBacktest';
+import type { SnapshotInput } from '@/lib/tierHistory';
 
 export interface GenerateSqlInput {
   allMatchedTrades: MatchedTrade[];
@@ -16,11 +27,49 @@ export interface GenerateSqlInput {
   settlementMap: Map<string, SettlementResult>;
 }
 
-export function generateSqlBody({
-  allMatchedTrades,
-  frequencyMap,
-  settlementMap,
-}: GenerateSqlInput): string {
+export interface GenerateSqlOutput {
+  sql: string;
+  snapshots: SnapshotInput[];
+}
+
+const STINKER_FLOOR_DAYS = 10;
+
+function fmtPct(v: number): string {
+  return (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
+}
+
+function fmtTier(t: number): string {
+  return `${t}¢`;
+}
+
+function rStr(label: DemoteSignalLabel | 'r30', r: number | null): string {
+  return r !== null ? `${label} ${fmtPct(r)}` : `no ${label}`;
+}
+
+function stinkerThresh(freq?: string): { days: number; trades: number } {
+  switch (freq) {
+    case 'hourly':
+    case 'fifteen_min': return { days: 30, trades: 50 };
+    case 'daily':       return { days: 30, trades: 30 };
+    case 'weekly':      return { days: 45, trades: 20 };
+    case 'monthly':     return { days: 60, trades: 6 };
+    case 'annual':      return { days: 90, trades: 10 };
+    case 'one_off':
+    case 'custom':      return { days: 90, trades: 5 };
+    default:            return { days: 90, trades: 30 };
+  }
+}
+
+function todayDateKey(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+export function generateSqlBody(input: GenerateSqlInput): GenerateSqlOutput {
+  const { allMatchedTrades, frequencyMap, settlementMap } = input;
   const today = new Date();
   const MS_PER_DAY = 1000 * 60 * 60 * 24;
 
@@ -34,80 +83,21 @@ export function generateSqlBody({
     if (!first || t.Exit_Date < first) firstTradeDateMap.set(series, t.Exit_Date);
   });
 
-  const thirtyDaysAgo = new Date();
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-  const recent30dStats = calculateSeriesStatsFromMatched(
-    allMatchedTrades.filter(t => t.Exit_Date >= thirtyDaysAgo)
-  );
-  const sql30dMap = new Map<string, number>();
-  recent30dStats.forEach((stats, series) => {
-    if (stats.totalCost > 0) sql30dMap.set(series, stats.pnl / stats.totalCost);
-  });
-
   const startOfToday = new Date(today);
   startOfToday.setHours(0, 0, 0, 0);
-  const yesterdayWindowStart = new Date(startOfToday);
-  yesterdayWindowStart.setDate(yesterdayWindowStart.getDate() - 30);
-  const yesterday30dStats = calculateSeriesStatsFromMatched(
-    allMatchedTrades.filter(t => t.Exit_Date >= yesterdayWindowStart && t.Exit_Date < startOfToday)
-  );
-  const ySql30dMap = new Map<string, number>();
-  yesterday30dStats.forEach((stats, series) => {
-    if (stats.totalCost > 0) ySql30dMap.set(series, stats.pnl / stats.totalCost);
-  });
-  const yAllSeriesStats = calculateSeriesStatsFromMatched(
-    allMatchedTrades.filter(t => t.Exit_Date < startOfToday)
-  );
 
   const allSeriesStats = calculateSeriesStatsFromMatched(allMatchedTrades);
-
-  const fourteenDaysAgo = new Date(startOfToday);
-  fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 14);
-  const trades14dCount = new Map<string, number>();
-  for (const t of allMatchedTrades) {
-    if (t.Exit_Date < fourteenDaysAgo) continue;
-    const { series } = parseTickerComponents(t.Ticker);
-    trades14dCount.set(series, (trades14dCount.get(series) ?? 0) + 1);
-  }
-
-  const threePointTier = (r30: number | null, tradesCount: number): 1 | 100 | 200 => {
-    if (r30 !== null && r30 >= 0 && tradesCount >= 2) return 200;
-    if (r30 !== null && r30 < 0 && tradesCount >= 2) return 1;
-    return 100;
-  };
-
-  const backtest = backtestTiers(allMatchedTrades);
-  const tpBacktest = backtestThreePoint(allMatchedTrades);
-  const STINKER_FLOOR_DAYS = 10;
-
-  const fmtPct = (v: number) => (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
-  const fmtTier = (t: number) => `${t}¢`;
-  const r30Str = (r: number | null) => r !== null ? `r30 ${fmtPct(r)}` : 'no r30';
-
-  const toDelete: string[] = [];
-  const stinkers: string[] = [];
-
-  const stinkerThresh = (freq?: string): { days: number; trades: number } => {
-    switch (freq) {
-      case 'hourly':
-      case 'fifteen_min': return { days: 30, trades: 50 };
-      case 'daily':       return { days: 30, trades: 30 };
-      case 'weekly':      return { days: 45, trades: 20 };
-      case 'monthly':     return { days: 60, trades: 6 };
-      case 'annual':      return { days: 90, trades: 10 };
-      case 'one_off':
-      case 'custom':      return { days: 90, trades: 5 };
-      default:            return { days: 90, trades: 30 };
-    }
-  };
+  const backtest = backtestTiers(allMatchedTrades, frequencyMap);
 
   type BucketEntry = { series: string; comment: string };
   const tierBuckets = new Map<number, BucketEntry[]>();
   TIER_LADDER.forEach(t => tierBuckets.set(t, []));
 
-  const threePointTop: BucketEntry[] = [];
-  const threePointMid: BucketEntry[] = [];
-  const threePointLow: BucketEntry[] = [];
+  const toDelete: string[] = [];
+  const stinkers: string[] = [];
+  const dormantHold: string[] = []; // existing dormant series we leave alone
+  const snapshots: SnapshotInput[] = [];
+  const today_s = todayDateKey();
 
   allSeriesStats.forEach((stats, series) => {
     const lastDate = lastTradeDateMap.get(series);
@@ -121,93 +111,118 @@ export function generateSqlBody({
     }
 
     const bt = backtest.get(series);
-
     if (bt) {
-      const fr = frequencyMap?.get(series);
-      const th = stinkerThresh(fr);
-      const daysAtFloor = bt.currentTier === 1 ? consecutiveDaysAtFloor(bt.history, 1) : 0;
-      if (daysSinceFirst >= th.days && stats.tradesCount >= th.trades && stats.pnl < 0 && daysAtFloor >= STINKER_FLOOR_DAYS) {
-        stinkers.push(series);
-      }
-
-      const last = bt.history[bt.history.length - 1];
-      let comment: string;
-
-      const todayStr = new Date().toLocaleDateString('en-CA');
-      const lastActiveSnap = [...bt.history].reverse().find(h => h.active);
-      const lastTradeDate = lastActiveSnap?.date ?? bt.history[bt.history.length - 1].date;
-      const lastTradeDaysAgo = Math.round((new Date(todayStr + 'T00:00:00').getTime() - new Date(lastTradeDate + 'T00:00:00').getTime()) / (1000 * 60 * 60 * 24));
-      const lastTradeStr = lastTradeDaysAgo === 0 ? 'last trade today' : lastTradeDaysAgo === 1 ? 'last trade yesterday' : `last trade ${lastTradeDaysAgo} days ago`;
-
-      const recentMove = [...bt.history].reverse().find(h => h.moved !== null);
-      const recentMoveDaysAgo = recentMove ? Math.round((new Date(todayStr + 'T00:00:00').getTime() - new Date(recentMove.date + 'T00:00:00').getTime()) / (1000 * 60 * 60 * 24)) : null;
-
-      if (bt.daysTracked <= 3) {
-        comment = `starter day ${bt.daysTracked} (${bt.recentActivityDays}d/14d)`;
-      } else if (recentMove && recentMoveDaysAgo !== null && recentMoveDaysAgo <= 3) {
-        const when = recentMoveDaysAgo === 0 ? 'today' : recentMoveDaysAgo === 1 ? 'yesterday' : `${recentMoveDaysAgo} days ago`;
-        const arrow = recentMove.moved === 'up' ? '↑' : '↓';
-        const verb = recentMove.moved === 'up' ? 'promoted' : 'demoted';
-        comment = `${arrow} ${verb} from ${fmtTier(recentMove.prevTier)} ${when} (${r30Str(last.r30)})`;
-      } else {
-        comment = `${lastTradeStr} (${r30Str(last.r30)})`;
-      }
-
-      tierBuckets.get(bt.currentTier)!.push({ series, comment });
+      bucketActive(series, stats, bt, daysSinceFirst);
     } else {
-      if (daysSinceFirst < 7) {
-        threePointLow.push({ series, comment: `starter day ${daysSinceFirst + 1} (${stats.tradesCount} trades, <5d/14d activity)` });
-        return;
-      }
-
-      const r30 = sql30dMap.get(series) ?? null;
-
-      let todayTier = threePointTier(r30, stats.tradesCount);
-      const yR30 = ySql30dMap.get(series) ?? null;
-      const yStats = yAllSeriesStats.get(series);
-      const yDaysSinceFirst = firstDate
-        ? (startOfToday.getTime() - firstDate.getTime()) / MS_PER_DAY
-        : 0;
-      const yTier = (yStats && yDaysSinceFirst >= 7)
-        ? threePointTier(yR30, yStats.tradesCount)
-        : null;
-
-      const recent14d = trades14dCount.get(series) ?? 0;
-      let promotionBlocked = false;
-      if (yTier !== null && todayTier > yTier && recent14d === 0) {
-        todayTier = yTier;
-        promotionBlocked = true;
-      }
-
-      let movePrefix = '';
-      if (yTier !== null && yTier !== todayTier) {
-        const arrow = todayTier > yTier ? '↑' : '↓';
-        const verb = todayTier > yTier ? 'promoted' : 'demoted';
-        movePrefix = `${arrow} ${verb} from ${yTier}¢ today · `;
-      } else if (promotionBlocked) {
-        movePrefix = `hold ${yTier}¢ (promotion blocked: no trade in 14d) · `;
-      }
-
-      const baseR30 = r30 !== null ? r30Str(r30) : '<2 trades or no 30d data';
-      const comment = `${movePrefix}3pt: ${baseR30}`;
-
-      if (todayTier === 200) {
-        threePointTop.push({ series, comment });
-      } else if (todayTier === 1) {
-        threePointLow.push({ series, comment });
-      } else {
-        threePointMid.push({ series, comment });
-      }
-
-      const fr3 = frequencyMap?.get(series);
-      const th3 = stinkerThresh(fr3);
-      const tpBt = tpBacktest.get(series);
-      const daysAtFloor3 = (tpBt && todayTier === 1) ? consecutiveDaysAtFloor(tpBt.history, 1) : 0;
-      if (daysSinceFirst >= th3.days && stats.tradesCount >= th3.trades && stats.pnl < 0 && daysAtFloor3 >= STINKER_FLOOR_DAYS) {
-        stinkers.push(series);
-      }
+      bucketDormant(series, stats, daysSinceFirst);
     }
   });
+
+  function bucketActive(
+    series: string,
+    stats: { tradesCount: number; pnl: number },
+    bt: SeriesBacktest,
+    daysSinceFirst: number,
+  ) {
+    const fr = frequencyMap?.get(series);
+    const th = stinkerThresh(fr);
+    const daysAtFloor = bt.currentTier === 1 ? consecutiveDaysAtFloor(bt.history, 1) : 0;
+    if (daysSinceFirst >= th.days && stats.tradesCount >= th.trades && stats.pnl < 0 && daysAtFloor >= STINKER_FLOOR_DAYS) {
+      stinkers.push(series);
+    }
+
+    // `bt` is only returned by backtestTiers when recentActivityDays ≥ 5,
+    // which guarantees at least one snapshot in history. Safe to take last.
+    const last = bt.history[bt.history.length - 1];
+    const sigLabel = last.signal;
+    const sigValue = sigLabel === 'r10' ? last.r10
+                    : sigLabel === 'r15' ? last.r15
+                    : sigLabel === 'r35' ? last.r35
+                    : null;
+
+    let comment: string;
+    const lastActiveSnap = [...bt.history].reverse().find(h => h.active);
+    const lastTradeDate = lastActiveSnap?.date ?? last.date;
+    const lastTradeDaysAgo = Math.round((new Date(today_s + 'T00:00:00').getTime() - new Date(lastTradeDate + 'T00:00:00').getTime()) / MS_PER_DAY);
+    const lastTradeStr = lastTradeDaysAgo === 0 ? 'last trade today'
+                       : lastTradeDaysAgo === 1 ? 'last trade yesterday'
+                       : `last trade ${lastTradeDaysAgo} days ago`;
+
+    const recentMove = [...bt.history].reverse().find(h => h.moved !== null);
+    const recentMoveDaysAgo = recentMove
+      ? Math.round((new Date(today_s + 'T00:00:00').getTime() - new Date(recentMove.date + 'T00:00:00').getTime()) / MS_PER_DAY)
+      : null;
+
+    const signalStr = sigLabel
+      ? rStr(sigLabel, sigValue)
+      : rStr('r30', last.r30);
+
+    if (bt.daysTracked <= 3) {
+      comment = `starter day ${bt.daysTracked} @ ${fmtTier(bt.entryTier)} (${bt.recentActivityDays}d/14d)`;
+    } else if (recentMove && recentMoveDaysAgo !== null && recentMoveDaysAgo <= 3) {
+      const when = recentMoveDaysAgo === 0 ? 'today'
+                 : recentMoveDaysAgo === 1 ? 'yesterday'
+                 : `${recentMoveDaysAgo} days ago`;
+      const arrow = recentMove.moved === 'up' ? '↑' : '↓';
+      const verb = recentMove.moved === 'up' ? 'promoted' : 'demoted';
+      comment = `${arrow} ${verb} from ${fmtTier(recentMove.prevTier)} ${when} (${signalStr})`;
+    } else {
+      comment = `${lastTradeStr} (${signalStr})`;
+    }
+
+    tierBuckets.get(bt.currentTier)!.push({ series, comment });
+
+    snapshots.push({
+      date: today_s,
+      series,
+      tier: bt.currentTier,
+      prev_tier: last.prevTier,
+      moved: last.moved ?? 'hold',
+      r10: last.r10,
+      r15: last.r15,
+      r35: last.r35,
+      signal: last.signal,
+      trades_today: last.tradesToday,
+      reason: comment,
+    });
+  }
+
+  function bucketDormant(
+    series: string,
+    stats: { tradesCount: number; pnl: number },
+    daysSinceFirst: number,
+  ) {
+    const freq = frequencyMap.get(series);
+    const entry = entryTierFor(freq);
+
+    if (daysSinceFirst < 7) {
+      // Brand-new dormant series — bucket into the entry-tier UPDATE so
+      // OCT installs it at the right starting size.
+      tierBuckets.get(entry)!.push({
+        series,
+        comment: `starter day ${daysSinceFirst + 1} @ ${fmtTier(entry)} (freq=${freq ?? 'unknown'})`,
+      });
+      snapshots.push({
+        date: today_s,
+        series,
+        tier: entry,
+        prev_tier: null,
+        moved: 'hold',
+        r10: null, r15: null, r35: null,
+        signal: null,
+        trades_today: stats.tradesCount,
+        reason: `starter @ ${fmtTier(entry)} freq=${freq ?? 'unknown'}`,
+      });
+      return;
+    }
+
+    // Existing but dormant (<5 trade days in last 14). Hold at last-known
+    // tier — no UPDATE emitted, no snapshot (we don't know what to write
+    // without history; reconcile happens next time activity returns).
+    dormantHold.push(series);
+  }
+
+  // -------------------------------- emit -------------------------------- //
 
   const emitInBlock = (entries: BucketEntry[]): string => {
     const sorted = [...entries].sort((a, b) => a.series.localeCompare(b.series));
@@ -238,22 +253,13 @@ export function generateSqlBody({
     );
   });
 
-  if (threePointTop.length) {
+  if (dormantHold.length) {
     parts.push(
-      `-- 200¢ (3-point: positive 30d, 2+ trades) — ${threePointTop.length} series\n` +
-      `UPDATE one_cent_series_filters SET position_size_cents = 200 WHERE series_ticker IN (\n${emitInBlock(threePointTop)}\n);`
-    );
-  }
-  if (threePointMid.length) {
-    parts.push(
-      `-- 100¢ (3-point: insufficient data) — ${threePointMid.length} series\n` +
-      `UPDATE one_cent_series_filters SET position_size_cents = 100 WHERE series_ticker IN (\n${emitInBlock(threePointMid)}\n);`
-    );
-  }
-  if (threePointLow.length) {
-    parts.push(
-      `-- 1¢ (3-point: negative 30d, 2+ trades) — ${threePointLow.length} series\n` +
-      `UPDATE one_cent_series_filters SET position_size_cents = 1 WHERE series_ticker IN (\n${emitInBlock(threePointLow)}\n);`
+      `-- Dormant (no UPDATE issued) — ${dormantHold.length} series\n` +
+      `-- These series have <5 trade days in last 14. Holding at whatever\n` +
+      `-- size the OCT DB currently has them at. Will reconcile next time\n` +
+      `-- they become active.\n` +
+      `-- ${dormantHold.slice(0, 20).join(', ')}${dormantHold.length > 20 ? ', ...' : ''}`
     );
   }
 
@@ -317,5 +323,6 @@ export function generateSqlBody({
   }
 
   const dateHeader = `-- Generated ${today.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}`;
-  return [dateHeader, ...parts].join('\n\n');
+  const sql = [dateHeader, ...parts].join('\n\n');
+  return { sql, snapshots };
 }
