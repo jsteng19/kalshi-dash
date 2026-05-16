@@ -1,6 +1,6 @@
 'use client';
 
-import React from 'react';
+import React, { useMemo } from 'react';
 import { Chart as ChartJS, ArcElement, Tooltip, Legend } from 'chart.js';
 import { Pie } from 'react-chartjs-2';
 import { MatchedTrade } from '@/utils/processData';
@@ -12,14 +12,15 @@ interface MakerTakerPieProps {
 }
 
 export default function MakerTakerPie({ matchedTrades }: MakerTakerPieProps) {
-  // Maker = 0 entry fees (providing liquidity), Taker = has entry fees (taking liquidity)
-  const makerContracts = matchedTrades
-    .filter(t => t.Entry_Fee === 0)
-    .reduce((sum, t) => sum + t.Contracts, 0);
-  
-  const takerContracts = matchedTrades
-    .filter(t => t.Entry_Fee > 0)
-    .reduce((sum, t) => sum + t.Contracts, 0);
+  const { makerContracts, takerContracts } = useMemo(() => {
+    let makerContracts = 0;
+    let takerContracts = 0;
+    for (const t of matchedTrades) {
+      if (t.Entry_Fee === 0) makerContracts += t.Contracts;
+      else takerContracts += t.Contracts;
+    }
+    return { makerContracts, takerContracts };
+  }, [matchedTrades]);
 
   const data = {
     labels: ['Maker (0 fees)', 'Taker (paid fees)'],
