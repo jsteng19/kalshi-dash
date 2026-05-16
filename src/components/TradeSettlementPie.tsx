@@ -1,6 +1,6 @@
 'use client';
 
-import React from 'react';
+import React, { useMemo } from 'react';
 import { Chart as ChartJS, ArcElement, Tooltip, Legend } from 'chart.js';
 import { Pie } from 'react-chartjs-2';
 import { MatchedTrade } from '@/utils/processData';
@@ -12,14 +12,15 @@ interface TradeSettlementPieProps {
 }
 
 export default function TradeSettlementPie({ matchedTrades }: TradeSettlementPieProps) {
-  // Calculate the number of contracts settled vs sold (exited early)
-  const settledContracts = matchedTrades
-    .filter(t => t.Exit_Type === 'settlement')
-    .reduce((sum, t) => sum + t.Contracts, 0);
-  
-  const soldContracts = matchedTrades
-    .filter(t => t.Exit_Type !== 'settlement')
-    .reduce((sum, t) => sum + t.Contracts, 0);
+  const { settledContracts, soldContracts } = useMemo(() => {
+    let settledContracts = 0;
+    let soldContracts = 0;
+    for (const t of matchedTrades) {
+      if (t.Exit_Type === 'settlement') settledContracts += t.Contracts;
+      else soldContracts += t.Contracts;
+    }
+    return { settledContracts, soldContracts };
+  }, [matchedTrades]);
 
   const data = {
     labels: ['Settled Contracts', 'Sold Contracts'],

@@ -684,13 +684,17 @@ const calculateBasicStatsFromMatchedTrades = (matchedTrades: MatchedTrade[]): Pr
     ? matchedTrades.reduce((sum, t) => sum + (t.Holding_Period_Days * t.Entry_Cost / totalTradeValue), 0)
     : 0;
   
-  // Win rates
-  const profitableTrades = matchedTrades.filter(t => t.Net_Profit > 0);
-  const settledTrades = matchedTrades.filter(t => t.Exit_Type === 'settlement');
-  const profitableSettledTrades = settledTrades.filter(t => t.Net_Profit > 0);
-  
-  const winRate = matchedTrades.length > 0 ? profitableTrades.length / matchedTrades.length : 0;
-  const settledWinRate = settledTrades.length > 0 ? profitableSettledTrades.length / settledTrades.length : 0;
+  // Win rates — single pass instead of three separate filters
+  let profitableCount = 0, settledCount = 0, profitableSettledCount = 0;
+  for (const t of matchedTrades) {
+    if (t.Net_Profit > 0) profitableCount++;
+    if (t.Exit_Type === 'settlement') {
+      settledCount++;
+      if (t.Net_Profit > 0) profitableSettledCount++;
+    }
+  }
+  const winRate = matchedTrades.length > 0 ? profitableCount / matchedTrades.length : 0;
+  const settledWinRate = settledCount > 0 ? profitableSettledCount / settledCount : 0;
   
   return {
     uniqueTickers,
@@ -802,8 +806,8 @@ export const processCSVData = (results: any): ProcessedData => {
 // Combine multiple ProcessedData objects into one
 export const combineProcessedData = (dataArray: ProcessedData[]): ProcessedData => {
   // Combine all trades and matched trades
-  const allTrades = dataArray.reduce<Trade[]>((acc, data) => [...acc, ...data.trades], []);
-  const allMatchedTrades = dataArray.reduce<MatchedTrade[]>((acc, data) => [...acc, ...data.matchedTrades], []);
+  const allTrades = dataArray.flatMap(d => d.trades);
+  const allMatchedTrades = dataArray.flatMap(d => d.matchedTrades);
   
   // Sort trades by date
   const sortedTrades = allTrades.sort((a, b) => a.Date.getTime() - b.Date.getTime());
@@ -813,7 +817,7 @@ export const combineProcessedData = (dataArray: ProcessedData[]): ProcessedData 
   const basicStats = calculateBasicStatsFromMatchedTrades(sortedMatchedTrades);
   
   // Combine original data
-  const originalData = dataArray.reduce<any[]>((acc, data) => [...acc, ...data.originalData], []);
+  const originalData = dataArray.flatMap(d => d.originalData);
   
   return {
     originalData,

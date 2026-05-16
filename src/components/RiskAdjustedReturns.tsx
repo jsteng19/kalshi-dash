@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { MatchedTrade } from '@/utils/processData';
 
 interface RiskAdjustedReturnsProps {
@@ -33,56 +33,37 @@ const calculateRiskMetrics = (matchedTrades: MatchedTrade[], initialCapital: num
   }
 
   // Get date range
-  const startDate = new Date(Math.min(...matchedTrades.map(t => t.Entry_Date.getTime())));
-  const endDate = new Date(Math.max(...matchedTrades.map(t => t.Exit_Date.getTime())));
+  const startDate = new Date(matchedTrades.reduce((min, t) => Math.min(min, t.Entry_Date.getTime()), Infinity));
+  const endDate = new Date(matchedTrades.reduce((max, t) => Math.max(max, t.Exit_Date.getTime()), -Infinity));
   
-  // Create daily portfolio value tracking
-  const portfolioValues: { [key: string]: number } = {};
-  const dateRange: Date[] = [];
-  const currentDate = new Date(startDate);
-  currentDate.setHours(0, 0, 0, 0);
-  
-  while (currentDate <= endDate) {
-    const dateKey = currentDate.toISOString().split('T')[0];
-    dateRange.push(new Date(currentDate));
-    portfolioValues[dateKey] = initialCapital; // Start with initial capital
-    currentDate.setDate(currentDate.getDate() + 1);
+  // Aggregate P&L by exit date in a single O(N) pass
+  const dailyPnl = new Map<string, number>();
+  for (const trade of matchedTrades) {
+    const key = trade.Exit_Date.toISOString().split('T')[0];
+    dailyPnl.set(key, (dailyPnl.get(key) ?? 0) + trade.Realized_Profit);
   }
 
-  // Apply P&L on exit dates using portfolio value approach
+  // Sweep date range once to build portfolio values — O(D) where D = number of days
   let cumulativeProfit = 0;
-  matchedTrades
-    .sort((a, b) => a.Exit_Date.getTime() - b.Exit_Date.getTime())
-    .forEach(trade => {
-      const exitDateKey = new Date(trade.Exit_Date).toISOString().split('T')[0];
-      cumulativeProfit += trade.Realized_Profit;
-      
-      // Update portfolio value from exit date onwards
-      let updateDate = new Date(trade.Exit_Date);
-      updateDate.setHours(0, 0, 0, 0);
-      
-      while (updateDate <= endDate) {
-        const updateDateKey = updateDate.toISOString().split('T')[0];
-        if (portfolioValues.hasOwnProperty(updateDateKey)) {
-          portfolioValues[updateDateKey] = initialCapital + cumulativeProfit;
-        }
-        updateDate.setDate(updateDate.getDate() + 1);
-      }
-    });
+  const portfolioValueArray: { date: Date; value: number }[] = [];
+  const sweepDate = new Date(startDate);
+  sweepDate.setHours(0, 0, 0, 0);
+  while (sweepDate <= endDate) {
+    const key = sweepDate.toISOString().split('T')[0];
+    cumulativeProfit += dailyPnl.get(key) ?? 0;
+    portfolioValueArray.push({ date: new Date(sweepDate), value: initialCapital + cumulativeProfit });
+    sweepDate.setDate(sweepDate.getDate() + 1);
+  }
 
   // Calculate daily returns from portfolio values
   const dailyReturns: number[] = [];
-  const portfolioValueArray = dateRange.map(date => ({
-    date,
-    value: portfolioValues[date.toISOString().split('T')[0]]
-  }));
 
   for (let i = 1; i < portfolioValueArray.length; i++) {
     const todayValue = portfolioValueArray[i].value;
     const yesterdayValue = portfolioValueArray[i - 1].value;
     
     if (yesterdayValue > 0) {
-      const dailyReturn = (todayValue - yesterdayValue) / yesterdayValue;
+      const dailyReturn = (todayValue - yesterdayValue) / initialCapital;
       dailyReturns.push(dailyReturn);
     }
   }
@@ -107,7 +88,7 @@ const calculateRiskMetrics = (matchedTrades: MatchedTrade[], initialCapital: num
   const avgDailyReturn = dailyReturns.reduce((sum, ret) => sum + ret, 0) / dailyReturns.length;
   
   // Calculate standard deviation using all daily returns
-  const variance = dailyReturns.reduce((sum, ret) => sum + Math.pow(ret - avgDailyReturn, 2), 0) / dailyReturns.length;
+  const variance = dailyReturns.reduce((sum, ret) => sum + Math.pow(ret - avgDailyReturn, 2), 0) / (dailyReturns.length - 1);
   const standardDeviation = Math.sqrt(variance);
 
   // Calculate total return from initial to final portfolio value
@@ -141,8 +122,18 @@ const calculateRiskMetrics = (matchedTrades: MatchedTrade[], initialCapital: num
 };
 
 export default function RiskAdjustedReturns({ matchedTrades }: RiskAdjustedReturnsProps) {
-  const [totalCapital, setTotalCapital] = useState<number>(10000);
-  const metrics = calculateRiskMetrics(matchedTrades, totalCapital);
+  const [inputCapital, setInputCapital] = useState<number>(10000);
+  const [debouncedCapital, setDebouncedCapital] = useState<number>(10000);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedCapital(inputCapital), 400);
+    return () => clearTimeout(timer);
+  }, [inputCapital]);
+
+  const metrics = useMemo(
+    () => calculateRiskMetrics(matchedTrades, debouncedCapital),
+    [matchedTrades, debouncedCapital]
+  );
 
   const formatPercent = (value: number) => {
     return new Intl.NumberFormat('en-US', {
@@ -170,8 +161,8 @@ export default function RiskAdjustedReturns({ matchedTrades }: RiskAdjustedRetur
             <input
               id="totalCapital"
               type="number"
-              value={totalCapital}
-              onChange={(e) => setTotalCapital(Number(e.target.value) || 0)}
+              value={inputCapital}
+              onChange={(e) => setInputCapital(Number(e.target.value) || 0)}
               className="pl-8 pr-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               placeholder="10000"
               min="1"
