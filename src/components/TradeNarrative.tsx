@@ -26,6 +26,7 @@ interface Message {
 }
 
 export default function TradeNarrative({ matchedTrades, basicStats, categoryMap }: TradeNarrativeProps) {
+  const [collapsed, setCollapsed] = useState(true);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -145,7 +146,15 @@ export default function TradeNarrative({ matchedTrades, basicStats, categoryMap 
 
   return (
     <div className="mt-6">
-      <h2 className="text-xl font-semibold mb-4">AI Trading Q&A</h2>
+      <button
+        type="button"
+        onClick={() => setCollapsed(c => !c)}
+        className="flex items-center gap-2 mb-4 text-xl font-semibold hover:text-blue-700 transition-colors"
+      >
+        <span className={`inline-block transition-transform ${collapsed ? '' : 'rotate-90'}`}>▶</span>
+        AI Trading Q&amp;A
+      </button>
+      {!collapsed && (
       <div className="bg-white shadow rounded-lg overflow-hidden">
         {/* Messages area */}
         <div className="h-72 overflow-y-auto p-4 space-y-3">
@@ -209,6 +218,7 @@ export default function TradeNarrative({ matchedTrades, basicStats, categoryMap 
           </button>
         </div>
       </div>
+      )}
     </div>
   );
 }
