@@ -2,7 +2,7 @@
 
 import React, { useMemo, useState, useDeferredValue } from 'react';
 import { MatchedTrade, calculateSeriesStatsFromMatched, parseTickerComponents, SettlementResult } from '@/utils/processData';
-import { backtestTiers, consecutiveDaysAtFloor, summarizeTierDistribution, TIER_LADDER, RECENT_ACTIVITY_WINDOW, RECENT_ACTIVITY_THRESHOLD, SeriesBacktest } from '@/utils/tierBacktest';
+import { evaluateLadder, TIER_LADDER, RECENT_ACTIVITY_WINDOW, PROMOTE_CONSECUTIVE_REQUIRED, SeriesEvaluation, LadderEvent } from '@/utils/tierBacktest';
 import { bucketByPositionSize, PositionSizeBucketStats, PositionSizeRange } from '@/utils/positionSizeAnalysis';
 
 interface SeriesStatsTableProps {
@@ -20,7 +20,7 @@ interface SeriesStatsTableProps {
 
 type SortField = 'series' | 'pnl' | 'proceeds' | 'cost' | 'fees' | 'trades' | 'winRate' | 'avgReturn' | 'trailing30d';
 type SortDirection = 'asc' | 'desc';
-type BacktestSortField = 'series' | 'activity' | 'firstTrade' | 'days' | 'trades' | 'currentTier' | 'lastR30' | 'signal' | 'status';
+type BacktestSortField = 'series' | 'activity' | 'firstTrade' | 'days' | 'trades' | 'event' | 'lastR30' | 'signal' | 'counter';
 type PosSizeSortField = 'bucket' | 'trades' | 'distinctSeries' | 'totalCost' | 'totalPnl' | 'totalFees' | 'roi' | 'winRate' | 'firstUsed' | 'lastUsed';
 
 export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, allMatchedTrades, frequencyMap, categoryMap, settlementMap, selectedSeries, onSeriesSelect, seriesFilter, onSeriesFilterChange }: SeriesStatsTableProps) {
@@ -28,9 +28,9 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [sqlModal, setSqlModal] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-  const [backtestModal, setBacktestModal] = useState<Map<string, SeriesBacktest> | null>(null);
+  const [backtestModal, setBacktestModal] = useState<Map<string, SeriesEvaluation> | null>(null);
   const [backtestSelectedSeries, setBacktestSelectedSeries] = useState<string | null>(null);
-  const [backtestSortField, setBacktestSortField] = useState<BacktestSortField>('currentTier');
+  const [backtestSortField, setBacktestSortField] = useState<BacktestSortField>('event');
   const [backtestSortDirection, setBacktestSortDirection] = useState<SortDirection>('desc');
   const [generatingSQL, setGeneratingSQL] = useState(false);
   const [posSizeModalOpen, setPosSizeModalOpen] = useState(false);
@@ -204,8 +204,7 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
 
     // Pre-fetch previously-emitted deletions so the worker can suppress
     // repeat DELETEs of the same dormant series day-after-day. If the API
-    // is unreachable (server in wrong mode), proceed with empty map —
-    // worst case is the noise we used to have.
+    // is unreachable, proceed with empty map — worst case is more noise.
     let previouslyDeleted: Record<string, string> = {};
     try {
       const r = await fetch('/api/tier-history/deleted');
@@ -223,24 +222,23 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
       new URL('../workers/generateSql.worker.ts', import.meta.url)
     );
     worker.onmessage = (e: MessageEvent<
-      | { ok: true; sql: string; snapshots: unknown[]; newDeletions: unknown[] }
+      | { ok: true; sql: string; events: unknown[]; newDeletions: unknown[] }
       | { ok: false; error: string }
     >) => {
       setGeneratingSQL(false);
       worker.terminate();
       if (e.data.ok) {
         setSqlModal(e.data.sql);
-        // Persist today's tier snapshot per series. Fire-and-forget — never
-        // block the SQL display on this. Failures are logged but harmless.
-        if (e.data.snapshots && e.data.snapshots.length > 0) {
-          fetch('/api/tier-history/snapshot', {
+        // Persist today's per-series event + state. Fire-and-forget.
+        if (e.data.events && e.data.events.length > 0) {
+          fetch('/api/tier-history/event', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ snapshots: e.data.snapshots }),
+            body: JSON.stringify({ events: e.data.events }),
           })
             .then(r => r.json())
-            .then(j => console.log('tier-history persisted:', j))
-            .catch(err => console.warn('tier-history persist failed (non-fatal):', err));
+            .then(j => console.log('tier-history events persisted:', j))
+            .catch(err => console.warn('tier-history events persist failed (non-fatal):', err));
         }
         // Record new deletions so we don't re-emit them tomorrow unless
         // the series produces new closed trades in the meantime.
@@ -282,7 +280,7 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
 
   const runBacktest = () => {
     if (!frequencyMap || !categoryMap) return;
-    const result = backtestTiers(allMatchedTrades, frequencyMap ?? new Map());
+    const result = evaluateLadder(allMatchedTrades, frequencyMap ?? new Map());
     setBacktestModal(result);
     setBacktestSelectedSeries(null);
   };
@@ -448,38 +446,24 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
       </div>
 
       {backtestModal !== null && (() => {
-        // Status priority for sort + badge display. Backtest pushes one
-        // snapshot per calendar day from firstTradeDay to today, so
-        // history[length-1] is always "today" and the prior 3 entries
-        // are yesterday / 2d ago / 3d ago.
-        const recentMove = (bt: SeriesBacktest): 'up' | 'down' | null => {
-          const last = bt.history[bt.history.length - 1];
-          return last?.moved ?? null;
+        // Event distribution + sort helpers (no tier tracking — KalshiPNL
+        // owns movement decisions, OCT owns absolute tier).
+        const eventRank = (e: LadderEvent): number =>
+          e === 'promote' ? 0 : e === 'demote' ? 1 : 2;
+        const eventBadge = (e: LadderEvent): { text: string; cls: string } => {
+          if (e === 'promote') return { text: '↑ promote', cls: 'bg-green-100 text-green-700' };
+          if (e === 'demote')  return { text: '↓ demote',  cls: 'bg-red-100 text-red-700' };
+          return { text: '—', cls: 'bg-gray-100 text-gray-500' };
         };
-        const inPromoteCooldown = (bt: SeriesBacktest): boolean => {
-          const n = bt.history.length;
-          for (let i = n - 1; i >= Math.max(0, n - 3); i--) {
-            if (bt.history[i].moved === 'up') return true;
-          }
-          return false;
-        };
-        const statusRank = (bt: SeriesBacktest): number => {
-          const mv = recentMove(bt);
-          if (mv === 'up') return 0;
-          if (mv === 'down') return 1;
-          if (inPromoteCooldown(bt)) return 2;
-          if (bt.daysTracked <= 3) return 3;
-          return 4;
-        };
-        const statusBadge = (bt: SeriesBacktest): { text: string; cls: string } => {
-          const mv = recentMove(bt);
-          if (mv === 'up')   return { text: '↑ promoted', cls: 'bg-green-100 text-green-700' };
-          if (mv === 'down') return { text: '↓ demoted',  cls: 'bg-red-100 text-red-700' };
-          if (inPromoteCooldown(bt)) return { text: '🔒 cooldown', cls: 'bg-amber-100 text-amber-700' };
-          if (bt.daysTracked <= 3)   return { text: '🆕 starter',  cls: 'bg-blue-100 text-blue-700' };
-          return { text: '', cls: '' };
-        };
-        const distribution = summarizeTierDistribution(backtestModal);
+        const distribution = (() => {
+          let promote = 0, demote = 0, hold = 0;
+          backtestModal.forEach(ev => {
+            if (ev.todayEvent === 'promote') promote++;
+            else if (ev.todayEvent === 'demote') demote++;
+            else hold++;
+          });
+          return { promote, demote, hold, total: backtestModal.size };
+        })();
         const selected = backtestSelectedSeries ? backtestModal.get(backtestSelectedSeries) : null;
         const allSorted = Array.from(backtestModal.values()).sort((a, b) => {
           const dir = backtestSortDirection === 'asc' ? 1 : -1;
@@ -489,9 +473,13 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
             case 'firstTrade': return dir * a.firstTradeDate.localeCompare(b.firstTradeDate);
             case 'days': return dir * (a.daysTracked - b.daysTracked);
             case 'trades': return dir * (a.totalTrades - b.totalTrades);
-            case 'currentTier':
-              if (a.currentTier !== b.currentTier) return dir * (a.currentTier - b.currentTier);
+            case 'event': {
+              const ra = eventRank(a.todayEvent), rb = eventRank(b.todayEvent);
+              if (ra !== rb) return dir * (ra - rb);
               return a.series.localeCompare(b.series);
+            }
+            case 'counter':
+              return dir * (a.todayConsecutivePositive - b.todayConsecutivePositive);
             case 'lastR30': {
               if (a.lastR30 === null && b.lastR30 === null) return 0;
               if (a.lastR30 === null) return 1;
@@ -499,15 +487,11 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
               return dir * (a.lastR30 - b.lastR30);
             }
             case 'signal': {
-              const av = a.lastDemoteSignal, bv = b.lastDemoteSignal;
+              const av = a.lastSignalValue, bv = b.lastSignalValue;
               if (av === null && bv === null) return 0;
               if (av === null) return 1;
               if (bv === null) return -1;
               return dir * (av - bv);
-            }
-            case 'status': {
-              const sa = statusRank(a), sb = statusRank(b);
-              return dir * (sa - sb);
             }
           }
         });
@@ -521,19 +505,25 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
               onClick={(e) => e.stopPropagation()}
             >
               <div className="flex items-center justify-between px-6 py-4 border-b">
-                <h3 className="text-lg font-semibold">Ladder Backtest — {backtestModal.size} series</h3>
+                <h3 className="text-lg font-semibold">Ladder Evaluator — {backtestModal.size} series</h3>
                 <button onClick={() => { setBacktestModal(null); setBacktestSelectedSeries(null); }} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
               </div>
               <div className="px-6 py-3 border-b bg-gray-50 text-xs text-gray-600">
-                Active series (≥{RECENT_ACTIVITY_THRESHOLD} trade days in last {RECENT_ACTIVITY_WINDOW}d) ride the {TIER_LADDER.length}-step ladder ({TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join(' → ')}). Entry tier by frequency: daily/weekly → 10¢, monthly/annual/one-off → 50¢. Days 1–3 pinned at entry tier. Promote: 3 consecutive r30 ≥ 0 days → +1. Demote: hybrid signal &lt; 0 → -1 (r10 if ≥30 trades/10d, else r15 if ≥10 trades/15d, else r35). Dormant series hold at OCT's current size.
+                Relative ladder model: KalshiPNL emits +1/-1 rung moves, OCT owns the absolute tier. {TIER_LADDER.length}-rung ladder ({TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join(' → ')}). Promote: {PROMOTE_CONSECUTIVE_REQUIRED} consecutive active days with r30 ≥ 0. Demote: hybrid signal &lt; 0 (r10 if ≥30 trades/10d, else r15 if ≥10 trades/15d, else r35).
               </div>
-              <div className="grid gap-px bg-gray-200 border-b shrink-0" style={{gridTemplateColumns: `repeat(${TIER_LADDER.length}, minmax(0, 1fr))`}}>
-                {distribution.map(d => (
-                  <div key={d.tier} className="bg-white px-2 py-2 text-center">
-                    <div className="text-xs text-gray-500">{d.tier === 1 ? '1¢' : `${d.tier}¢`}</div>
-                    <div className={`text-lg font-semibold ${d.count === 0 ? 'text-gray-300' : 'text-gray-900'}`}>{d.count}</div>
-                  </div>
-                ))}
+              <div className="grid grid-cols-3 gap-px bg-gray-200 border-b shrink-0">
+                <div className="bg-white px-3 py-3 text-center">
+                  <div className="text-xs text-gray-500">↑ promote today</div>
+                  <div className={`text-2xl font-semibold ${distribution.promote === 0 ? 'text-gray-300' : 'text-green-700'}`}>{distribution.promote}</div>
+                </div>
+                <div className="bg-white px-3 py-3 text-center">
+                  <div className="text-xs text-gray-500">↓ demote today</div>
+                  <div className={`text-2xl font-semibold ${distribution.demote === 0 ? 'text-gray-300' : 'text-red-700'}`}>{distribution.demote}</div>
+                </div>
+                <div className="bg-white px-3 py-3 text-center">
+                  <div className="text-xs text-gray-500">hold</div>
+                  <div className={`text-2xl font-semibold ${distribution.hold === 0 ? 'text-gray-300' : 'text-gray-700'}`}>{distribution.hold}</div>
+                </div>
               </div>
               {selected ? (
                 <>
@@ -542,17 +532,18 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
                     <div className="mb-3">
                       <h4 className="text-lg font-semibold">{selected.series}</h4>
                       <div className="text-xs text-gray-500">
-                        Recent activity: <span className="font-medium">{selected.recentActivityDays}d/{RECENT_ACTIVITY_WINDOW}d</span> · First trade: {selected.firstTradeDate} · {selected.totalTrades} trades · {selected.daysTracked} days tracked · Current tier: <span className="font-semibold">{selected.currentTier === 1 ? '1¢' : `${selected.currentTier}¢`}</span>
+                        Recent activity: <span className="font-medium">{selected.recentActivityDays}d/{RECENT_ACTIVITY_WINDOW}d</span> · First trade: {selected.firstTradeDate} · {selected.totalTrades} trades · {selected.daysTracked} days tracked · Counter: <span className="font-semibold">{selected.todayConsecutivePositive}/{PROMOTE_CONSECUTIVE_REQUIRED}</span>
                       </div>
                     </div>
                     <table className="min-w-full text-xs">
                       <thead className="bg-gray-50">
                         <tr>
                           <th className="px-3 py-2 text-left font-medium text-gray-500">Date</th>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500">Tier</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Event</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Signal</th>
                           <th className="px-3 py-2 text-left font-medium text-gray-500">r30</th>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500">Streak</th>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500">Move</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Counter</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Active</th>
                         </tr>
                       </thead>
                     </table>
@@ -560,19 +551,23 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
                   <div className="flex-1 overflow-auto px-6 pb-4">
                     <table className="min-w-full text-xs">
                       <tbody className="divide-y divide-gray-100">
-                        {[...selected.history].reverse().map((h, i) => (
-                          <tr key={i} className={h.moved ? 'bg-yellow-50' : ''}>
-                            <td className="px-3 py-1 font-mono text-gray-700">{h.date}</td>
-                            <td className="px-3 py-1 font-semibold">{h.tier === 1 ? '1¢' : `${h.tier}¢`}</td>
-                            <td className={`px-3 py-1 ${h.r30 === null ? 'text-gray-300' : h.r30 >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                              {h.r30 === null ? '—' : formatPercent(h.r30)}
-                            </td>
-                            <td className="px-3 py-1 text-gray-500">{h.consecutivePositive}</td>
-                            <td className={`px-3 py-1 font-medium ${h.moved === 'up' ? 'text-green-700' : h.moved === 'down' ? 'text-red-700' : 'text-gray-400'}`}>
-                              {h.moved === 'up' ? '↑ promoted' : h.moved === 'down' ? '↓ demoted' : '—'}
-                            </td>
-                          </tr>
-                        ))}
+                        {[...selected.history].reverse().map((h, i) => {
+                          const eb = eventBadge(h.event);
+                          return (
+                            <tr key={i} className={h.event !== 'hold' ? 'bg-yellow-50' : ''}>
+                              <td className="px-3 py-1 font-mono text-gray-700">{h.date}</td>
+                              <td className="px-3 py-1"><span className={`px-2 py-0.5 rounded text-[10px] font-medium ${eb.cls}`}>{eb.text}</span></td>
+                              <td className={`px-3 py-1 ${h.signalValue === null ? 'text-gray-300' : h.signalValue >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                {h.signal && h.signalValue !== null ? `${h.signal} ${formatPercent(h.signalValue)}` : '—'}
+                              </td>
+                              <td className={`px-3 py-1 ${h.r30 === null ? 'text-gray-300' : h.r30 >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                {h.r30 === null ? '—' : formatPercent(h.r30)}
+                              </td>
+                              <td className="px-3 py-1 text-gray-500">{h.consecutivePositive}/{PROMOTE_CONSECUTIVE_REQUIRED}</td>
+                              <td className="px-3 py-1 text-gray-500">{h.active ? `${h.tradesToday}` : '—'}</td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -588,8 +583,8 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
                           <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('firstTrade')}>First Trade<BacktestSortIcon field="firstTrade" /></th>
                           <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('days')}>Days<BacktestSortIcon field="days" /></th>
                           <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('trades')}>Trades<BacktestSortIcon field="trades" /></th>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('currentTier')}>Current Tier<BacktestSortIcon field="currentTier" /></th>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('status')}>Status<BacktestSortIcon field="status" /></th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('event')}>Today<BacktestSortIcon field="event" /></th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('counter')}>Counter<BacktestSortIcon field="counter" /></th>
                           <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('signal')}>Demote Signal<BacktestSortIcon field="signal" /></th>
                           <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('lastR30')}>r30<BacktestSortIcon field="lastR30" /></th>
                         </tr>
@@ -599,32 +594,33 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
                   <div className="flex-1 overflow-auto">
                     <table className="min-w-full text-xs">
                       <tbody className="divide-y divide-gray-100">
-                        {allSorted.map(bt => (
-                          <tr key={bt.series} className="hover:bg-blue-50 cursor-pointer" onClick={() => setBacktestSelectedSeries(bt.series)}>
-                            <td className="px-3 py-1 font-medium text-blue-700">{bt.series}</td>
-                            <td className="px-3 py-1 text-gray-500">{bt.recentActivityDays}d/{RECENT_ACTIVITY_WINDOW}d</td>
-                            <td className="px-3 py-1 font-mono text-gray-500">{bt.firstTradeDate}</td>
-                            <td className="px-3 py-1 text-gray-500">{bt.daysTracked}</td>
-                            <td className="px-3 py-1 text-gray-500">{bt.totalTrades}</td>
-                            <td className="px-3 py-1 font-semibold">{bt.currentTier === 1 ? '1¢' : `${bt.currentTier}¢`}</td>
-                            <td className="px-3 py-1">
-                              {(() => { const b = statusBadge(bt); return b.text ? <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${b.cls}`}>{b.text}</span> : <span className="text-gray-300">—</span>; })()}
-                            </td>
-                            <td className={`px-3 py-1 ${bt.lastDemoteSignal === null ? 'text-gray-300' : bt.lastDemoteSignal >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                              {bt.lastSignalLabel && bt.lastDemoteSignal !== null ? `${bt.lastSignalLabel} ${formatPercent(bt.lastDemoteSignal)}` : '—'}
-                            </td>
-                            <td className={`px-3 py-1 ${bt.lastR30 === null ? 'text-gray-300' : bt.lastR30 >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                              {bt.lastR30 === null ? '—' : formatPercent(bt.lastR30)}
-                            </td>
-                          </tr>
-                        ))}
+                        {allSorted.map(ev => {
+                          const eb = eventBadge(ev.todayEvent);
+                          return (
+                            <tr key={ev.series} className="hover:bg-blue-50 cursor-pointer" onClick={() => setBacktestSelectedSeries(ev.series)}>
+                              <td className="px-3 py-1 font-medium text-blue-700">{ev.series}</td>
+                              <td className="px-3 py-1 text-gray-500">{ev.recentActivityDays}d/{RECENT_ACTIVITY_WINDOW}d</td>
+                              <td className="px-3 py-1 font-mono text-gray-500">{ev.firstTradeDate}</td>
+                              <td className="px-3 py-1 text-gray-500">{ev.daysTracked}</td>
+                              <td className="px-3 py-1 text-gray-500">{ev.totalTrades}</td>
+                              <td className="px-3 py-1"><span className={`px-2 py-0.5 rounded text-[10px] font-medium ${eb.cls}`}>{eb.text}</span></td>
+                              <td className="px-3 py-1 text-gray-500">{ev.todayConsecutivePositive}/{PROMOTE_CONSECUTIVE_REQUIRED}</td>
+                              <td className={`px-3 py-1 ${ev.lastSignalValue === null ? 'text-gray-300' : ev.lastSignalValue >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                {ev.lastSignal && ev.lastSignalValue !== null ? `${ev.lastSignal} ${formatPercent(ev.lastSignalValue)}` : '—'}
+                              </td>
+                              <td className={`px-3 py-1 ${ev.lastR30 === null ? 'text-gray-300' : ev.lastR30 >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                {ev.lastR30 === null ? '—' : formatPercent(ev.lastR30)}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
                 </>
               )}
               <div className="px-6 py-3 border-t text-xs text-gray-500 bg-gray-50">
-                Click a series to see its day-by-day tier history. Click Back to return.
+                Click a series to see its day-by-day event history. Click Back to return.
               </div>
             </div>
           </div>
@@ -645,10 +641,9 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
               <button onClick={() => setSqlModal(null)} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
             </div>
             <div className="px-6 py-2 text-xs text-gray-500 border-b bg-gray-50">
-              <span className="font-medium text-gray-700">{TIER_LADDER.length}-step ladder</span> (≥{RECENT_ACTIVITY_THRESHOLD}d/{RECENT_ACTIVITY_WINDOW}d active): {TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join('→')}. Entry tier 10¢ (daily/weekly) / 50¢ (monthly+); days 1–3 pinned at entry. Promote: 3 consecutive r30 ≥ 0 → +1. Demote: hybrid signal &lt; 0 → -1 (r10 if active ≥30 trades/10d, else r15 if ≥10 trades/15d, else r35). &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">Dormant</span> (low activity): no UPDATE emitted; OCT holds current size. &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">DELETE</span> — no trades in 60+ days. &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">Disabled stinkers</span> — per-frequency thresholds (hourly/daily 30d/30t, weekly 45d/20t, monthly 60d/6t, annual/one_off 90d), all-time negative, parked at 1¢ for 10+ consecutive days, non-weather.
+              <span className="font-medium text-gray-700">Relative ladder</span> ({TIER_LADDER.length} rungs: {TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join('→')}). OCT owns absolute tier; KalshiPNL emits +1/-1 moves via CASE-WHEN. Promote: {PROMOTE_CONSECUTIVE_REQUIRED} consecutive active days r30 ≥ 0. Demote: hybrid signal &lt; 0 (r10 if ≥30 trades/10d, else r15 if ≥10 trades/15d, else r35). &nbsp;·&nbsp;
+              <span className="font-medium text-gray-700">DELETE</span> — no trades in 60+ days (row-age guarded). Suppressed if previously emitted with same lastTradeDate. &nbsp;·&nbsp;
+              <span className="font-medium text-gray-700">Disabled stinkers</span> — per-freq thresholds (hourly/daily 30d/30t, weekly 45d/20t, monthly 60d/6t, annual/one_off 90d), all-time negative, sustained-negative signal 30+ days, non-weather.
             </div>
             <textarea
               readOnly

@@ -1,74 +1,75 @@
+/**
+ * Ladder evaluator — Option B (relative model).
+ *
+ * KalshiPNL no longer tracks absolute tier numbers. It evaluates per
+ * series, per day, whether today should PROMOTE +1 rung, DEMOTE -1 rung,
+ * or HOLD. OCT owns the absolute tier value; KalshiPNL emits relative
+ * moves applied via SQL CASE-WHEN mapping.
+ *
+ * Inputs: MatchedTrade[] from CSV.
+ * Output: Map<series, SeriesEvaluation> — today's event + full per-day
+ *         event history for UI/audit.
+ *
+ * Rules (per series, per day from first trade day to today):
+ *   - active = ≥1 closed trade landed on this day
+ *   - r10/r15/r30/r35 = cost-weighted return over trailing N days
+ *   - demote signal (hybrid): r10 if n10 ≥ 30, else r15 if n15 ≥ 10, else r35
+ *   - PROMOTE: 3 cumulative active days with r30 ≥ 0 (counter persists
+ *     across inactive days; only resets on promote or demote). Implicit
+ *     3-active-day cooldown between promotes.
+ *   - DEMOTE: any day with demote signal < 0. Counter resets.
+ *   - HOLD: otherwise; counter persists across inactive days.
+ *
+ * The ladder mapping (1, 10, 25, 50, 75, 100, 125, 150, 175, 200) is
+ * still defined here for SQL CASE-WHEN generation, but the evaluator
+ * itself never references it.
+ */
+
 import { MatchedTrade, parseTickerComponents } from './processData';
 
 export const TIER_LADDER = [1, 10, 25, 50, 75, 100, 125, 150, 175, 200] as const;
 export type Tier = typeof TIER_LADDER[number];
 
 export const RECENT_ACTIVITY_WINDOW = 14;
-export const RECENT_ACTIVITY_THRESHOLD = 5;
-
 export const PROMOTE_CONSECUTIVE_REQUIRED = 3;
-export const STARTER_DAYS = 3;
 
-// Demote signal selection thresholds. The active window is whichever has
-// enough trades to be statistically meaningful; falls back to longer windows
-// for low-frequency series.
+// Demote signal selection thresholds.
 export const N_TRADES_FOR_R10 = 30;
 export const N_TRADES_FOR_R15 = 10;
 
-/**
- * Entry tier when a series first appears. Frequency-aware:
- *   - daily / weekly / sub-day  → rung 2 (10¢ / 10 contracts)
- *   - monthly / annual / one_off / custom → rung 4 (50¢)
- *   - unknown → rung 2 (safer default)
- */
-export function entryTierFor(frequency: string | undefined): number {
-  switch (frequency) {
-    case 'fifteen_min':
-    case 'hourly':
-    case 'daily':
-    case 'weekly':
-      return 10;
-    case 'monthly':
-    case 'annual':
-    case 'one_off':
-    case 'custom':
-      return 50;
-    default:
-      return 10;
-  }
-}
-
 export type DemoteSignalLabel = 'r10' | 'r15' | 'r35';
+export type LadderEvent = 'promote' | 'demote' | 'hold';
 
-export interface TierSnapshot {
-  date: string;
-  tier: number;
-  prevTier: number;
-  r10: number | null;
-  r15: number | null;
-  r35: number | null;
-  // r30 retained for promote signal + display
-  r30: number | null;
-  signal: DemoteSignalLabel | null;
-  consecutivePositive: number;
-  moved: 'up' | 'down' | null;
+export interface DaySnapshot {
+  date: string;                          // YYYY-MM-DD
   tradesToday: number;
   active: boolean;
+  r10: number | null;
+  r15: number | null;
+  r30: number | null;
+  r35: number | null;
+  signal: DemoteSignalLabel | null;
+  signalValue: number | null;            // numeric value of the chosen signal
+  event: LadderEvent;
+  consecutivePositive: number;
 }
 
-export interface SeriesBacktest {
+export interface SeriesEvaluation {
   series: string;
   frequency: string;
-  entryTier: number;
   firstTradeDate: string;
-  currentTier: number;
   totalTrades: number;
   daysTracked: number;
+  recentActivityDays: number;            // distinct trade days in last 14d (UI only)
+  // Today's outcome + state
+  todayEvent: LadderEvent;
+  todayConsecutivePositive: number;
   lastR30: number | null;
-  lastDemoteSignal: number | null;
-  lastSignalLabel: DemoteSignalLabel | null;
-  recentActivityDays: number;
-  history: TierSnapshot[];
+  lastSignal: DemoteSignalLabel | null;
+  lastSignalValue: number | null;
+  lastPromoteDate: string | null;
+  lastDemoteDate: string | null;
+  history: DaySnapshot[];
 }
 
 function dateKey(d: Date): string {
@@ -94,21 +95,8 @@ function daysBetween(a: Date, b: Date): number {
   return Math.round((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24));
 }
 
-function ladderUp(tier: number): number {
-  const idx = TIER_LADDER.indexOf(tier as Tier);
-  if (idx === -1 || idx === TIER_LADDER.length - 1) return tier;
-  return TIER_LADDER[idx + 1];
-}
-
-function ladderDown(tier: number): number {
-  const idx = TIER_LADDER.indexOf(tier as Tier);
-  if (idx === -1 || idx === 0) return tier;
-  return TIER_LADDER[idx - 1];
-}
-
 /**
- * Sliding-window cost-weighted return helper.
- * Maintains (sumPnl / sumCost) over [windowStart, cursor] day-inclusive.
+ * Sliding cost-weighted return over [cursor - (windowDays - 1), cursor].
  */
 class SlidingWindow {
   private leftIdx = 0;
@@ -156,27 +144,13 @@ function pickDemoteSignal(
 }
 
 /**
- * Backtest series through the 10-step ladder using frequency-aware entry
- * tier + hybrid demote signal (r10 high-volume dailies / r15 weeklies /
- * r35 monthlies+). Promote still uses r30 for stability.
- *
- * Rules:
- *   - Starter (days 1..STARTER_DAYS): pinned at entryTier(frequency).
- *     Accumulate consecutive-positive counter using r30.
- *   - Day STARTER_DAYS+1 onward:
- *       demoteSignal < 0 → -1 step, counter resets
- *       active AND r30 ≥ 0 AND counter+1 ≥ PROMOTE_CONSECUTIVE_REQUIRED → +1 step, counter resets
- *       active AND r30 ≥ 0 (counter not yet 3) → counter += 1, hold
- *       else → hold
- *   - Clamped to [1, 200].
- *   - Only series with ≥RECENT_ACTIVITY_THRESHOLD trade days in the last
- *     RECENT_ACTIVITY_WINDOW are returned (others are dormant; caller
- *     handles them separately).
+ * Evaluate every series with ≥1 closed trade. No tier tracking — output
+ * is per-day events (promote/demote/hold) and the resulting state.
  */
-export function backtestTiers(
+export function evaluateLadder(
   allMatchedTrades: MatchedTrade[],
   frequencyMap: Map<string, string> = new Map(),
-): Map<string, SeriesBacktest> {
+): Map<string, SeriesEvaluation> {
   const bySeries = new Map<string, MatchedTrade[]>();
   for (const t of allMatchedTrades) {
     const { series } = parseTickerComponents(t.Ticker);
@@ -184,7 +158,7 @@ export function backtestTiers(
     bySeries.get(series)!.push(t);
   }
 
-  const result = new Map<string, SeriesBacktest>();
+  const result = new Map<string, SeriesEvaluation>();
   const today = startOfDay(new Date());
 
   bySeries.forEach((trades, series) => {
@@ -200,15 +174,14 @@ export function backtestTiers(
       }
     }
     const recentActivityDays = recentTradeDates.size;
-    if (recentActivityDays < RECENT_ACTIVITY_THRESHOLD) return;
 
     const totalDays = daysBetween(firstTradeDay, today);
     const freq = frequencyMap.get(series) ?? 'unknown';
-    const entryTier = entryTierFor(freq);
 
-    let tier = entryTier;
     let consecutive = 0;
-    const history: TierSnapshot[] = [];
+    let lastPromoteDate: string | null = null;
+    let lastDemoteDate: string | null = null;
+    const history: DaySnapshot[] = [];
 
     const w10 = new SlidingWindow(sorted, tradeDays, 10);
     const w15 = new SlidingWindow(sorted, tradeDays, 15);
@@ -218,13 +191,13 @@ export function backtestTiers(
     let rightIdxLast = 0;
     for (let dayIdx = 0; dayIdx <= totalDays; dayIdx++) {
       const cursor = addDays(firstTradeDay, dayIdx);
+      const cursorKey = dateKey(cursor);
 
       const { r: r10, n: n10 } = w10.advanceTo(cursor);
       const { r: r15, n: n15 } = w15.advanceTo(cursor);
       const { r: r30 } = w30.advanceTo(cursor);
       const { r: r35 } = w35.advanceTo(cursor);
 
-      // tradesToday derived from how many trades fall on this exact day
       let tradesToday = 0;
       while (rightIdxLast < sorted.length
           && tradeDays[rightIdxLast].getTime() <= cursor.getTime()) {
@@ -235,62 +208,50 @@ export function backtestTiers(
 
       const { value: demoteSig, label: signalLabel } = pickDemoteSignal(r10, n10, r15, n15, r35);
 
-      let moved: 'up' | 'down' | null = null;
-      const prevTier = tier;
-
-      if (dayIdx < STARTER_DAYS) {
-        // Pinned at entry tier; accumulate counter for post-starter promote.
-        if (active && r30 !== null && r30 >= 0) consecutive += 1;
-        else if (demoteSig !== null && demoteSig < 0) consecutive = 0;
-      } else {
-        if (demoteSig !== null && demoteSig < 0) {
-          tier = ladderDown(tier);
+      let event: LadderEvent = 'hold';
+      if (demoteSig !== null && demoteSig < 0) {
+        event = 'demote';
+        consecutive = 0;
+        lastDemoteDate = cursorKey;
+      } else if (active && r30 !== null && r30 >= 0) {
+        consecutive += 1;
+        if (consecutive >= PROMOTE_CONSECUTIVE_REQUIRED) {
+          event = 'promote';
           consecutive = 0;
-        } else if (active && r30 !== null && r30 >= 0) {
-          consecutive += 1;
-          if (consecutive >= PROMOTE_CONSECUTIVE_REQUIRED) {
-            tier = ladderUp(tier);
-            consecutive = 0;
-          }
+          lastPromoteDate = cursorKey;
         }
       }
 
-      if (tier > prevTier) moved = 'up';
-      else if (tier < prevTier) moved = 'down';
-
       history.push({
-        date: dateKey(cursor),
-        tier,
-        prevTier,
-        r10, r15, r30, r35,
-        signal: signalLabel,
-        consecutivePositive: consecutive,
-        moved,
+        date: cursorKey,
         tradesToday,
         active,
+        r10, r15, r30, r35,
+        signal: signalLabel,
+        signalValue: signalLabel === 'r10' ? r10
+                    : signalLabel === 'r15' ? r15
+                    : signalLabel === 'r35' ? r35
+                    : null,
+        event,
+        consecutivePositive: consecutive,
       });
     }
 
     const lastSnap = history[history.length - 1];
-    const lastSignalValue = lastSnap
-      ? (lastSnap.signal === 'r10' ? lastSnap.r10
-         : lastSnap.signal === 'r15' ? lastSnap.r15
-         : lastSnap.signal === 'r35' ? lastSnap.r35
-         : null)
-      : null;
-
     result.set(series, {
       series,
       frequency: freq,
-      entryTier,
       firstTradeDate: dateKey(firstTradeDay),
-      currentTier: tier,
       totalTrades: sorted.length,
       daysTracked: history.length,
-      lastR30: lastSnap ? lastSnap.r30 : null,
-      lastDemoteSignal: lastSignalValue,
-      lastSignalLabel: lastSnap?.signal ?? null,
       recentActivityDays,
+      todayEvent: lastSnap?.event ?? 'hold',
+      todayConsecutivePositive: consecutive,
+      lastR30: lastSnap?.r30 ?? null,
+      lastSignal: lastSnap?.signal ?? null,
+      lastSignalValue: lastSnap?.signalValue ?? null,
+      lastPromoteDate,
+      lastDemoteDate,
       history,
     });
   });
@@ -299,53 +260,25 @@ export function backtestTiers(
 }
 
 /**
- * Count consecutive days the series has been parked at `floor` ending today.
+ * Generate the SQL CASE-WHEN ladder-up mapping (used in PROMOTE blocks).
+ * Each rung maps to the next-higher rung; top rung maps to itself (no-op).
  */
-export function consecutiveDaysAtFloor(
-  history: { tier: number }[],
-  floor: number = 1,
-): number {
-  let n = 0;
-  for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i].tier === floor) n++;
-    else break;
+export function ladderUpCase(column: string = 'position_size_cents'): string {
+  const parts: string[] = [];
+  for (let i = 0; i < TIER_LADDER.length - 1; i++) {
+    parts.push(`WHEN ${TIER_LADDER[i]} THEN ${TIER_LADDER[i + 1]}`);
   }
-  return n;
+  return `CASE ${column} ${parts.join(' ')} ELSE ${column} END`;
 }
 
 /**
- * Days since the most recent promote in history (null if never promoted).
+ * Generate the SQL CASE-WHEN ladder-down mapping (used in DEMOTE blocks).
+ * Each rung maps to the next-lower rung; bottom rung maps to itself.
  */
-export function daysSinceLastPromote(history: TierSnapshot[]): number | null {
-  for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i].moved === 'up') {
-      const lastDate = new Date(history[i].date + 'T00:00:00');
-      const todayStr = new Date().toISOString().slice(0, 10);
-      const today = new Date(todayStr + 'T00:00:00');
-      return Math.round((today.getTime() - lastDate.getTime()) / (1000 * 60 * 60 * 24));
-    }
+export function ladderDownCase(column: string = 'position_size_cents'): string {
+  const parts: string[] = [];
+  for (let i = TIER_LADDER.length - 1; i > 0; i--) {
+    parts.push(`WHEN ${TIER_LADDER[i]} THEN ${TIER_LADDER[i - 1]}`);
   }
-  return null;
-}
-
-/**
- * Summarize how many series landed at each tier.
- */
-export function summarizeTierDistribution(
-  backtest: Map<string, SeriesBacktest>,
-): { tier: number; count: number; series: string[] }[] {
-  const buckets = new Map<number, string[]>();
-  TIER_LADDER.forEach(t => buckets.set(t, []));
-
-  backtest.forEach(bt => {
-    const arr = buckets.get(bt.currentTier) ?? [];
-    arr.push(bt.series);
-    buckets.set(bt.currentTier, arr);
-  });
-
-  return TIER_LADDER.map(tier => ({
-    tier,
-    count: buckets.get(tier)!.length,
-    series: buckets.get(tier)!.sort(),
-  }));
+  return `CASE ${column} ${parts.join(' ')} ELSE ${column} END`;
 }

@@ -1,14 +1,17 @@
 /**
- * Tier history SQLite layer.
+ * Tier history SQLite layer (Option B — relative ladder model).
  *
- * Local persistence for the 10-step ladder: today's tier per series,
- * full transition history, and cooldown timestamps.
+ * KalshiPNL no longer tracks absolute tier numbers. OCT owns the tier.
+ * KalshiPNL only tracks per-series state needed to decide the next move:
  *
- * DB lives at ~/.local/share/kalshipnl/kalshipnl.db (outside Dropbox).
- * Dropbox-syncing SQLite WAL files causes intermittent SQLITE_BUSY and
- * "(Conflicted copy)" files when the project dir is opened on two
- * machines. Keep this DB local; export to Dropbox manually if backup
- * is desired.
+ *   - tier_state: rolling per-series state machine (counter, last event,
+ *     last promote/demote dates).
+ *   - tier_events: append-only audit log of every evaluation per day.
+ *   - tier_deleted: dormant series we've already DELETE'd, suppressed
+ *     until CSV history advances.
+ *
+ * DB lives at ~/.local/share/kalshipnl/kalshipnl.db (outside Dropbox to
+ * avoid WAL sync conflicts). Override with KALSHIPNL_DATA_DIR env var.
  *
  * Server-side only — do not import from client components.
  */
@@ -36,160 +39,154 @@ function db(): Database.Database {
 
 function initSchema(d: Database.Database): void {
   d.exec(`
-    CREATE TABLE IF NOT EXISTS tier_history (
-      date         TEXT    NOT NULL,
-      series       TEXT    NOT NULL,
-      tier         INTEGER NOT NULL,
-      prev_tier    INTEGER,
-      moved        TEXT,
-      r10          REAL,
-      r15          REAL,
-      r35          REAL,
-      signal       TEXT,
-      trades_today INTEGER,
-      reason       TEXT,
+    -- Per-series rolling state machine. One row per series.
+    CREATE TABLE IF NOT EXISTS tier_state (
+      series                TEXT PRIMARY KEY,
+      consecutive_positive  INTEGER NOT NULL DEFAULT 0,
+      last_event            TEXT,                 -- 'promote' | 'demote' | 'hold' | null
+      last_event_date       TEXT,                 -- YYYY-MM-DD
+      last_promote_date     TEXT,
+      last_demote_date      TEXT,
+      updated_at            TEXT NOT NULL
+    );
+
+    -- Append-only per-day per-series audit log of evaluations.
+    CREATE TABLE IF NOT EXISTS tier_events (
+      date          TEXT NOT NULL,                -- YYYY-MM-DD
+      series        TEXT NOT NULL,
+      event         TEXT NOT NULL,                -- 'promote' | 'demote' | 'hold'
+      r10           REAL,
+      r15           REAL,
+      r30           REAL,
+      r35           REAL,
+      signal_label  TEXT,                         -- 'r10' | 'r15' | 'r35' | null
+      consecutive   INTEGER,
+      reason        TEXT,
       PRIMARY KEY (date, series)
     );
-    CREATE INDEX IF NOT EXISTS idx_tier_history_series_date
-      ON tier_history (series, date DESC);
+    CREATE INDEX IF NOT EXISTS idx_tier_events_series_date
+      ON tier_events (series, date DESC);
 
-    CREATE TABLE IF NOT EXISTS tier_cooldown (
-      series             TEXT PRIMARY KEY,
-      current_tier       INTEGER NOT NULL,
-      last_promote_date  TEXT,
-      last_demote_date   TEXT,
-      last_move_date     TEXT,
-      updated_at         TEXT NOT NULL
-    );
-
-    -- Series we've previously emitted in a DELETE block. Suppresses
-    -- re-emission of the same series day after day when its CSV history
-    -- hasn't changed. A new fill on the series advances last_trade_at_deletion
-    -- mismatches and the series naturally re-enters normal flow (the new
-    -- fill makes daysSinceLast < 60, so it won't hit toDelete anyway).
+    -- Series we previously emitted in a DELETE block. Suppresses
+    -- re-emission while CSV history hasn't changed.
     CREATE TABLE IF NOT EXISTS tier_deleted (
-      series                   TEXT PRIMARY KEY,
-      deleted_on               TEXT NOT NULL,   -- YYYY-MM-DD we first emitted DELETE
-      last_trade_at_deletion   TEXT NOT NULL    -- YYYY-MM-DD lastDate at that moment
+      series                  TEXT PRIMARY KEY,
+      deleted_on              TEXT NOT NULL,
+      last_trade_at_deletion  TEXT NOT NULL
     );
   `);
 }
 
-export interface TierHistoryRow {
-  date: string;
-  series: string;
-  tier: number;
-  prev_tier: number | null;
-  moved: 'up' | 'down' | 'hold' | null;
-  r10: number | null;
-  r15: number | null;
-  r35: number | null;
-  signal: 'r10' | 'r15' | 'r35' | null;
-  trades_today: number | null;
-  reason: string | null;
-}
+// ----------------------------------------------------------------------
+// State (tier_state)
+// ----------------------------------------------------------------------
 
-export interface CooldownRow {
+export type LadderEvent = 'promote' | 'demote' | 'hold';
+
+export interface TierStateRow {
   series: string;
-  current_tier: number;
+  consecutive_positive: number;
+  last_event: LadderEvent | null;
+  last_event_date: string | null;
   last_promote_date: string | null;
   last_demote_date: string | null;
-  last_move_date: string | null;
   updated_at: string;
 }
 
-export function getCurrentTier(series: string): number | null {
-  const row = db()
-    .prepare('SELECT current_tier FROM tier_cooldown WHERE series = ?')
-    .get(series) as { current_tier: number } | undefined;
-  return row ? row.current_tier : null;
-}
-
-export function getCooldown(series: string): CooldownRow | null {
-  const row = db()
-    .prepare('SELECT * FROM tier_cooldown WHERE series = ?')
-    .get(series) as CooldownRow | undefined;
-  return row ?? null;
-}
-
-export function getAllCooldowns(): Map<string, CooldownRow> {
-  const rows = db().prepare('SELECT * FROM tier_cooldown').all() as CooldownRow[];
-  const m = new Map<string, CooldownRow>();
+export function getAllStates(): Map<string, TierStateRow> {
+  const rows = db().prepare('SELECT * FROM tier_state').all() as TierStateRow[];
+  const m = new Map<string, TierStateRow>();
   for (const r of rows) m.set(r.series, r);
   return m;
 }
 
-export function getHistory(series: string, limit = 60): TierHistoryRow[] {
-  return db()
-    .prepare('SELECT * FROM tier_history WHERE series = ? ORDER BY date DESC LIMIT ?')
-    .all(series, limit) as TierHistoryRow[];
+export function getState(series: string): TierStateRow | null {
+  return (db().prepare('SELECT * FROM tier_state WHERE series = ?').get(series) as TierStateRow | undefined) ?? null;
 }
 
-export interface SnapshotInput {
-  date: string;
+// ----------------------------------------------------------------------
+// Events (tier_events) + paired state UPSERT
+// ----------------------------------------------------------------------
+
+export interface EventInput {
+  date: string;                    // YYYY-MM-DD
   series: string;
-  tier: number;
-  prev_tier: number | null;
-  moved: 'up' | 'down' | 'hold' | null;
+  event: LadderEvent;
   r10: number | null;
   r15: number | null;
+  r30: number | null;
   r35: number | null;
-  signal: 'r10' | 'r15' | 'r35' | null;
-  trades_today: number | null;
+  signal_label: 'r10' | 'r15' | 'r35' | null;
+  consecutive: number;
   reason: string | null;
 }
 
 /**
- * Write one day's snapshot per series + refresh cooldown row.
- * Idempotent: same (date, series) overwrites itself via UPSERT.
- * Wrapped in a single transaction for atomicity across both tables.
+ * Write today's evaluation per series + refresh tier_state in one tx.
+ * Idempotent: re-running same date overwrites the event row, and state
+ * upsert is a deterministic function of inputs.
  */
-export function writeSnapshots(snaps: SnapshotInput[]): { written: number } {
-  if (snaps.length === 0) return { written: 0 };
-
+export function writeEvents(events: EventInput[]): { written: number } {
+  if (events.length === 0) return { written: 0 };
   const d = db();
-  const insertHist = d.prepare(`
-    INSERT INTO tier_history
-      (date, series, tier, prev_tier, moved, r10, r15, r35, signal, trades_today, reason)
-    VALUES (@date, @series, @tier, @prev_tier, @moved, @r10, @r15, @r35, @signal, @trades_today, @reason)
+
+  const insertEvent = d.prepare(`
+    INSERT INTO tier_events
+      (date, series, event, r10, r15, r30, r35, signal_label, consecutive, reason)
+    VALUES (@date, @series, @event, @r10, @r15, @r30, @r35, @signal_label, @consecutive, @reason)
     ON CONFLICT(date, series) DO UPDATE SET
-      tier=excluded.tier, prev_tier=excluded.prev_tier, moved=excluded.moved,
-      r10=excluded.r10, r15=excluded.r15, r35=excluded.r35, signal=excluded.signal,
-      trades_today=excluded.trades_today, reason=excluded.reason
+      event=excluded.event, r10=excluded.r10, r15=excluded.r15, r30=excluded.r30,
+      r35=excluded.r35, signal_label=excluded.signal_label,
+      consecutive=excluded.consecutive, reason=excluded.reason
   `);
 
-  const upsertCool = d.prepare(`
-    INSERT INTO tier_cooldown
-      (series, current_tier, last_promote_date, last_demote_date, last_move_date, updated_at)
-    VALUES (@series, @current_tier, @last_promote_date, @last_demote_date, @last_move_date, @updated_at)
+  const upsertState = d.prepare(`
+    INSERT INTO tier_state
+      (series, consecutive_positive, last_event, last_event_date,
+       last_promote_date, last_demote_date, updated_at)
+    VALUES (@series, @consecutive, @event, @date,
+            @last_promote_date, @last_demote_date, @updated_at)
     ON CONFLICT(series) DO UPDATE SET
-      current_tier=excluded.current_tier,
-      last_promote_date=COALESCE(excluded.last_promote_date, tier_cooldown.last_promote_date),
-      last_demote_date =COALESCE(excluded.last_demote_date,  tier_cooldown.last_demote_date),
-      last_move_date   =COALESCE(excluded.last_move_date,    tier_cooldown.last_move_date),
-      updated_at       =excluded.updated_at
+      consecutive_positive=excluded.consecutive_positive,
+      last_event=excluded.last_event,
+      last_event_date=excluded.last_event_date,
+      last_promote_date=COALESCE(excluded.last_promote_date, tier_state.last_promote_date),
+      last_demote_date =COALESCE(excluded.last_demote_date,  tier_state.last_demote_date),
+      updated_at=excluded.updated_at
   `);
 
-  const tx = d.transaction((rows: SnapshotInput[]) => {
+  const now = new Date().toISOString();
+  const tx = d.transaction((rows: EventInput[]) => {
     let n = 0;
     for (const r of rows) {
-      insertHist.run(r);
-      upsertCool.run({
+      insertEvent.run(r);
+      upsertState.run({
         series: r.series,
-        current_tier: r.tier,
-        last_promote_date: r.moved === 'up' ? r.date : null,
-        last_demote_date:  r.moved === 'down' ? r.date : null,
-        last_move_date:    r.moved && r.moved !== 'hold' ? r.date : null,
-        updated_at: new Date().toISOString(),
+        consecutive: r.consecutive,
+        event: r.event,
+        date: r.date,
+        last_promote_date: r.event === 'promote' ? r.date : null,
+        last_demote_date:  r.event === 'demote'  ? r.date : null,
+        updated_at: now,
       });
       n++;
     }
     return n;
   });
-
-  const written = tx(snaps);
-  return { written };
+  return { written: tx(events) };
 }
+
+export interface TierEventRow extends EventInput {}
+
+export function getEvents(series: string, limit = 90): TierEventRow[] {
+  return db()
+    .prepare('SELECT * FROM tier_events WHERE series = ? ORDER BY date DESC LIMIT ?')
+    .all(series, limit) as TierEventRow[];
+}
+
+// ----------------------------------------------------------------------
+// Deleted (tier_deleted) — unchanged from prior implementation
+// ----------------------------------------------------------------------
 
 export interface DeletedRow {
   series: string;
@@ -206,15 +203,10 @@ export function getAllDeleted(): Map<string, DeletedRow> {
 
 export interface NewDeletionInput {
   series: string;
-  lastTradeDate: string;   // YYYY-MM-DD
-  emittedOn: string;       // YYYY-MM-DD (today)
+  lastTradeDate: string;
+  emittedOn: string;
 }
 
-/**
- * Upsert newly-emitted deletions. UPDATE if series already tracked but
- * lastTradeDate advanced (series re-emerged then went dormant again);
- * INSERT if first time.
- */
 export function recordDeletions(items: NewDeletionInput[]): { written: number } {
   if (items.length === 0) return { written: 0 };
   const d = db();
@@ -233,23 +225,14 @@ export function recordDeletions(items: NewDeletionInput[]): { written: number } 
   return { written: tx(items) };
 }
 
-/**
- * Days between two YYYY-MM-DD strings (b - a), or null on parse failure.
- */
+// ----------------------------------------------------------------------
+// Date helpers
+// ----------------------------------------------------------------------
+
 export function daysBetween(a: string | null, b: string): number | null {
   if (!a) return null;
   const am = Date.parse(a + 'T00:00:00Z');
   const bm = Date.parse(b + 'T00:00:00Z');
   if (isNaN(am) || isNaN(bm)) return null;
   return Math.round((bm - am) / 86400000);
-}
-
-/**
- * Returns true if the series is within its promote cooldown window
- * (days since last promote < cooldownDays).
- */
-export function inPromoteCooldown(cool: CooldownRow | null, today: string, cooldownDays = 3): boolean {
-  if (!cool || !cool.last_promote_date) return false;
-  const d = daysBetween(cool.last_promote_date, today);
-  return d !== null && d < cooldownDays;
 }
