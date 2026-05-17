@@ -17,7 +17,10 @@
  *   - PROMOTE: 3 cumulative active days with r30 ≥ 0 (counter persists
  *     across inactive days; only resets on promote or demote). Implicit
  *     3-active-day cooldown between promotes.
- *   - DEMOTE: any day with demote signal < 0. Counter resets.
+ *   - DEMOTE: any ACTIVE day with demote signal < 0. Counter resets.
+ *     (Inactive days never fire events — stale signals from old trades
+ *     in the trailing window would otherwise produce spurious demotes
+ *     every day until those trades fall out of the window.)
  *   - HOLD: otherwise; counter persists across inactive days.
  *
  * The ladder mapping (1, 10, 25, 50, 75, 100, 125, 150, 175, 200) is
@@ -209,7 +212,11 @@ export function evaluateLadder(
       const { value: demoteSig, label: signalLabel } = pickDemoteSignal(r10, n10, r15, n15, r35);
 
       let event: LadderEvent = 'hold';
-      if (demoteSig !== null && demoteSig < 0) {
+      // Only fire events on active days — fresh evidence required.
+      // Without this guard, a stale negative signal from old trades
+      // still in the trailing window would emit DEMOTE every day for
+      // the next 35 days, even on quiet/inactive days.
+      if (active && demoteSig !== null && demoteSig < 0) {
         event = 'demote';
         consecutive = 0;
         lastDemoteDate = cursorKey;
