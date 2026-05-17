@@ -162,7 +162,16 @@ export function evaluateLadder(
   }
 
   const result = new Map<string, SeriesEvaluation>();
-  const today = startOfDay(new Date());
+  // "Today" = latest trade date in the CSV, not the system clock. CSV
+  // is the source of fresh evidence. If you upload a CSV through May 16,
+  // May 16 is "today" for evaluation purposes — even if the system clock
+  // says May 17 and you have no trades dated May 17 yet.
+  let maxExitMs = 0;
+  for (const t of allMatchedTrades) {
+    const m = t.Exit_Date.getTime();
+    if (m > maxExitMs) maxExitMs = m;
+  }
+  const today = maxExitMs > 0 ? startOfDay(new Date(maxExitMs)) : startOfDay(new Date());
 
   bySeries.forEach((trades, series) => {
     const sorted = [...trades].sort((a, b) => a.Exit_Date.getTime() - b.Exit_Date.getTime());
