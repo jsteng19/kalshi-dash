@@ -61,6 +61,17 @@ function initSchema(d: Database.Database): void {
       last_move_date     TEXT,
       updated_at         TEXT NOT NULL
     );
+
+    -- Series we've previously emitted in a DELETE block. Suppresses
+    -- re-emission of the same series day after day when its CSV history
+    -- hasn't changed. A new fill on the series advances last_trade_at_deletion
+    -- mismatches and the series naturally re-enters normal flow (the new
+    -- fill makes daysSinceLast < 60, so it won't hit toDelete anyway).
+    CREATE TABLE IF NOT EXISTS tier_deleted (
+      series                   TEXT PRIMARY KEY,
+      deleted_on               TEXT NOT NULL,   -- YYYY-MM-DD we first emitted DELETE
+      last_trade_at_deletion   TEXT NOT NULL    -- YYYY-MM-DD lastDate at that moment
+    );
   `);
 }
 
@@ -178,6 +189,48 @@ export function writeSnapshots(snaps: SnapshotInput[]): { written: number } {
 
   const written = tx(snaps);
   return { written };
+}
+
+export interface DeletedRow {
+  series: string;
+  deleted_on: string;
+  last_trade_at_deletion: string;
+}
+
+export function getAllDeleted(): Map<string, DeletedRow> {
+  const rows = db().prepare('SELECT * FROM tier_deleted').all() as DeletedRow[];
+  const m = new Map<string, DeletedRow>();
+  for (const r of rows) m.set(r.series, r);
+  return m;
+}
+
+export interface NewDeletionInput {
+  series: string;
+  lastTradeDate: string;   // YYYY-MM-DD
+  emittedOn: string;       // YYYY-MM-DD (today)
+}
+
+/**
+ * Upsert newly-emitted deletions. UPDATE if series already tracked but
+ * lastTradeDate advanced (series re-emerged then went dormant again);
+ * INSERT if first time.
+ */
+export function recordDeletions(items: NewDeletionInput[]): { written: number } {
+  if (items.length === 0) return { written: 0 };
+  const d = db();
+  const stmt = d.prepare(`
+    INSERT INTO tier_deleted (series, deleted_on, last_trade_at_deletion)
+    VALUES (@series, @emittedOn, @lastTradeDate)
+    ON CONFLICT(series) DO UPDATE SET
+      deleted_on=excluded.deleted_on,
+      last_trade_at_deletion=excluded.last_trade_at_deletion
+  `);
+  const tx = d.transaction((rows: NewDeletionInput[]) => {
+    let n = 0;
+    for (const r of rows) { stmt.run(r); n++; }
+    return n;
+  });
+  return { written: tx(items) };
 }
 
 /**

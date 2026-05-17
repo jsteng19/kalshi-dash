@@ -7,8 +7,8 @@ import { generateSqlBody, GenerateSqlInput } from '../utils/generateSqlBody';
 
 self.onmessage = (e: MessageEvent<GenerateSqlInput>) => {
   try {
-    const { sql, snapshots } = generateSqlBody(e.data);
-    (self as unknown as Worker).postMessage({ ok: true, sql, snapshots });
+    const { sql, snapshots, newDeletions } = generateSqlBody(e.data);
+    (self as unknown as Worker).postMessage({ ok: true, sql, snapshots, newDeletions });
   } catch (err) {
     (self as unknown as Worker).postMessage({
       ok: false,

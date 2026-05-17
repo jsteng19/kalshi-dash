@@ -198,13 +198,34 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
     return <span className="ml-1">{sortDirection === 'asc' ? '↑' : '↓'}</span>;
   };
 
-  const generateSQL = () => {
+  const generateSQL = async () => {
     if (!frequencyMap) return;
     setGeneratingSQL(true);
+
+    // Pre-fetch previously-emitted deletions so the worker can suppress
+    // repeat DELETEs of the same dormant series day-after-day. If the API
+    // is unreachable (server in wrong mode), proceed with empty map —
+    // worst case is the noise we used to have.
+    let previouslyDeleted: Record<string, string> = {};
+    try {
+      const r = await fetch('/api/tier-history/deleted');
+      if (r.ok) {
+        const j = await r.json();
+        previouslyDeleted = j?.deleted ?? {};
+      } else {
+        console.warn('tier-history deleted fetch returned', r.status);
+      }
+    } catch (err) {
+      console.warn('tier-history deleted fetch failed (non-fatal):', err);
+    }
+
     const worker = new Worker(
       new URL('../workers/generateSql.worker.ts', import.meta.url)
     );
-    worker.onmessage = (e: MessageEvent<{ ok: true; sql: string; snapshots: unknown[] } | { ok: false; error: string }>) => {
+    worker.onmessage = (e: MessageEvent<
+      | { ok: true; sql: string; snapshots: unknown[]; newDeletions: unknown[] }
+      | { ok: false; error: string }
+    >) => {
       setGeneratingSQL(false);
       worker.terminate();
       if (e.data.ok) {
@@ -221,6 +242,18 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
             .then(j => console.log('tier-history persisted:', j))
             .catch(err => console.warn('tier-history persist failed (non-fatal):', err));
         }
+        // Record new deletions so we don't re-emit them tomorrow unless
+        // the series produces new closed trades in the meantime.
+        if (e.data.newDeletions && e.data.newDeletions.length > 0) {
+          fetch('/api/tier-history/deleted', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deletions: e.data.newDeletions }),
+          })
+            .then(r => r.json())
+            .then(j => console.log('tier-history deletions recorded:', j))
+            .catch(err => console.warn('tier-history deletions persist failed (non-fatal):', err));
+        }
       } else {
         console.error('generateSQL worker:', e.data.error);
       }
@@ -235,6 +268,7 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
       frequencyMap,
       categoryMap,
       settlementMap: settlementMap ?? new Map(),
+      previouslyDeleted,
     });
   };
 

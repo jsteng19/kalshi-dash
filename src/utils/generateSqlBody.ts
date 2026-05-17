@@ -16,7 +16,7 @@
 
 import { MatchedTrade, parseTickerComponents, calculateSeriesStatsFromMatched, SettlementResult } from './processData';
 import { backtestTiers, consecutiveDaysAtFloor, entryTierFor, TIER_LADDER, SeriesBacktest, DemoteSignalLabel } from './tierBacktest';
-import type { SnapshotInput } from '@/lib/tierHistory';
+import type { SnapshotInput, NewDeletionInput } from '@/lib/tierHistory';
 
 export interface GenerateSqlInput {
   allMatchedTrades: MatchedTrade[];
@@ -25,11 +25,16 @@ export interface GenerateSqlInput {
   // the SQL emitter beyond settlement_strategy categorization upstream.
   categoryMap?: Map<string, string>;
   settlementMap: Map<string, SettlementResult>;
+  // Series previously emitted in a DELETE block, keyed by series ticker,
+  // value is the lastTradeDate at the time of that prior deletion. Used
+  // to suppress repeat emission while CSV history hasn't advanced.
+  previouslyDeleted?: Record<string, string>;
 }
 
 export interface GenerateSqlOutput {
   sql: string;
   snapshots: SnapshotInput[];
+  newDeletions: NewDeletionInput[];
 }
 
 const STINKER_FLOOR_DAYS = 10;
@@ -69,7 +74,7 @@ function todayDateKey(): string {
 }
 
 export function generateSqlBody(input: GenerateSqlInput): GenerateSqlOutput {
-  const { allMatchedTrades, frequencyMap, settlementMap } = input;
+  const { allMatchedTrades, frequencyMap, settlementMap, previouslyDeleted = {} } = input;
   const today = new Date();
   const MS_PER_DAY = 1000 * 60 * 60 * 24;
 
@@ -94,10 +99,19 @@ export function generateSqlBody(input: GenerateSqlInput): GenerateSqlOutput {
   TIER_LADDER.forEach(t => tierBuckets.set(t, []));
 
   const toDelete: string[] = [];
+  const newDeletions: NewDeletionInput[] = [];
   const stinkers: string[] = [];
-  const dormantHold: string[] = []; // existing dormant series we leave alone
   const snapshots: SnapshotInput[] = [];
   const today_s = todayDateKey();
+
+  // Helper: format Date -> YYYY-MM-DD in local-day terms (matches the
+  // backtest's calendar-day model + the persisted last_trade_at_deletion).
+  const ymd = (d: Date): string => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  };
 
   allSeriesStats.forEach((stats, series) => {
     const lastDate = lastTradeDateMap.get(series);
@@ -106,7 +120,15 @@ export function generateSqlBody(input: GenerateSqlInput): GenerateSqlOutput {
     const daysSinceFirst = firstDate ? Math.floor((startOfToday.getTime() - firstDate.getTime()) / MS_PER_DAY) : 0;
 
     if (daysSinceLast > 60) {
+      // Suppress repeat emission: if previously deleted AND CSV history
+      // hasn't advanced, skip entirely. Otherwise record + emit.
+      const lastTradeStr = lastDate ? ymd(lastDate) : '';
+      const prevLastTrade = previouslyDeleted[series];
+      if (prevLastTrade && prevLastTrade === lastTradeStr) {
+        return;
+      }
       toDelete.push(series);
+      newDeletions.push({ series, lastTradeDate: lastTradeStr, emittedOn: today_s });
       return;
     }
 
@@ -188,38 +210,15 @@ export function generateSqlBody(input: GenerateSqlInput): GenerateSqlOutput {
   }
 
   function bucketDormant(
-    series: string,
-    stats: { tradesCount: number; pnl: number },
-    daysSinceFirst: number,
+    _series: string,
+    _stats: { tradesCount: number; pnl: number },
+    _daysSinceFirst: number,
   ) {
-    const freq = frequencyMap.get(series);
-    const entry = entryTierFor(freq);
-
-    if (daysSinceFirst < 7) {
-      // Brand-new dormant series — bucket into the entry-tier UPDATE so
-      // OCT installs it at the right starting size.
-      tierBuckets.get(entry)!.push({
-        series,
-        comment: `starter day ${daysSinceFirst + 1} @ ${fmtTier(entry)} (freq=${freq ?? 'unknown'})`,
-      });
-      snapshots.push({
-        date: today_s,
-        series,
-        tier: entry,
-        prev_tier: null,
-        moved: 'hold',
-        r10: null, r15: null, r35: null,
-        signal: null,
-        trades_today: stats.tradesCount,
-        reason: `starter @ ${fmtTier(entry)} freq=${freq ?? 'unknown'}`,
-      });
-      return;
-    }
-
-    // Existing but dormant (<5 trade days in last 14). Hold at last-known
-    // tier — no UPDATE emitted, no snapshot (we don't know what to write
-    // without history; reconcile happens next time activity returns).
-    dormantHold.push(series);
+    // Dormant = invisible. No UPDATE, no comment block, no snapshot.
+    // OCT cron sets the entry size at insert (10¢ daily/weekly /
+    // 50¢ monthly+) and the row stays untouched until the series crosses
+    // the activity threshold (≥5 trade days in last 14d), at which point
+    // it appears in the normal tier UPDATE block via bucketActive.
   }
 
   // -------------------------------- emit -------------------------------- //
@@ -252,16 +251,6 @@ export function generateSqlBody(input: GenerateSqlInput): GenerateSqlOutput {
       `UPDATE one_cent_series_filters SET position_size_cents = ${tier} WHERE series_ticker IN (\n${emitInBlock(bucket)}\n);`
     );
   });
-
-  if (dormantHold.length) {
-    parts.push(
-      `-- Dormant (no UPDATE issued) — ${dormantHold.length} series\n` +
-      `-- These series have <5 trade days in last 14. Holding at whatever\n` +
-      `-- size the OCT DB currently has them at. Will reconcile next time\n` +
-      `-- they become active.\n` +
-      `-- ${dormantHold.slice(0, 20).join(', ')}${dormantHold.length > 20 ? ', ...' : ''}`
-    );
-  }
 
   if (stinkers.length) {
     parts.push(
@@ -324,5 +313,5 @@ export function generateSqlBody(input: GenerateSqlInput): GenerateSqlOutput {
 
   const dateHeader = `-- Generated ${today.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}`;
   const sql = [dateHeader, ...parts].join('\n\n');
-  return { sql, snapshots };
+  return { sql, snapshots, newDeletions };
 }
