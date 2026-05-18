@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo, useState, useDeferredValue } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import { MatchedTrade, calculateSeriesStatsFromMatched, parseTickerComponents, SettlementResult } from '@/utils/processData';
 import { evaluateLadder, TIER_LADDER, RECENT_ACTIVITY_WINDOW, PROMOTE_CONSECUTIVE_REQUIRED, SeriesEvaluation, LadderEvent } from '@/utils/tierBacktest';
 import { bucketByPositionSize, PositionSizeBucketStats, PositionSizeRange } from '@/utils/positionSizeAnalysis';
@@ -86,11 +86,27 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
     return arr;
   }, [posSizeRows, posSizeSortField, posSizeSortDir]);
 
-  // Defer heavy props so the table render + filter input stay snappy when the
-  // user types. React renders the OLD seriesData immediately, then schedules
-  // recompute at low priority; UI never freezes mid-keystroke.
-  const deferredMatched = useDeferredValue(matchedTrades);
-  const deferredRecent = useDeferredValue(recentMatchedTrades);
+  // Local input state — only commits to parent (triggering heavy recomputes)
+  // when the user clicks Apply or presses Enter. Keeps typing snappy on
+  // 150k+ trade datasets.
+  const [filterInput, setFilterInput] = useState(seriesFilter ?? '');
+
+  // Keep local input in sync when parent clears the filter externally
+  // (Clear Data button, selectedSeries-driven clears, etc.).
+  useEffect(() => {
+    setFilterInput(seriesFilter ?? '');
+  }, [seriesFilter]);
+
+  const applyFilter = () => {
+    if (onSeriesFilterChange && filterInput !== (seriesFilter ?? '')) {
+      onSeriesFilterChange(filterInput);
+    }
+  };
+
+  const clearFilter = () => {
+    setFilterInput('');
+    if (onSeriesFilterChange) onSeriesFilterChange('');
+  };
 
   const handleBacktestSort = (field: BacktestSortField) => {
     if (backtestSortField === field) {
@@ -107,16 +123,16 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
   };
 
   const trailing30dMap = useMemo(() => {
-    const statsMap = calculateSeriesStatsFromMatched(deferredRecent);
+    const statsMap = calculateSeriesStatsFromMatched(recentMatchedTrades);
     const result = new Map<string, number>();
     statsMap.forEach((stats, series) => {
       if (stats.totalCost > 0) result.set(series, stats.pnl / stats.totalCost);
     });
     return result;
-  }, [deferredRecent]);
+  }, [recentMatchedTrades]);
 
   const seriesData = useMemo(() => {
-    const statsMap = calculateSeriesStatsFromMatched(deferredMatched);
+    const statsMap = calculateSeriesStatsFromMatched(matchedTrades);
 
     return Array.from(statsMap.values()).map(stats => ({
       series: stats.series,
@@ -129,7 +145,7 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
       winRate: stats.tradesCount > 0 ? stats.winCount / stats.tradesCount : 0,
       trailing30dAvgReturn: trailing30dMap.has(stats.series) ? trailing30dMap.get(stats.series)! : null,
     }));
-  }, [deferredMatched, trailing30dMap]);
+  }, [matchedTrades, trailing30dMap]);
 
   const sortedData = useMemo(() => {
     return [...seriesData].sort((a, b) => {
@@ -333,24 +349,42 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
             );
           })()}
           {onSeriesFilterChange && (
-            <div className="relative">
-              <input
-                type="text"
-                value={seriesFilter || ''}
-                onChange={(e) => onSeriesFilterChange(e.target.value)}
-                placeholder="Filter series name..."
-                className="w-48 px-3 py-1.5 text-sm border border-gray-300 rounded-full focus:outline-none focus:ring-2 focus:ring-orange-300 focus:border-orange-400"
-              />
-              {seriesFilter && (
-                <button
-                  onClick={() => onSeriesFilterChange('')}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
-              )}
+            <div className="flex items-center gap-2">
+              <div className="relative">
+                <input
+                  type="text"
+                  value={filterInput}
+                  onChange={(e) => setFilterInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') applyFilter();
+                  }}
+                  placeholder="Filter series name..."
+                  className="w-48 px-3 py-1.5 text-sm border border-gray-300 rounded-full focus:outline-none focus:ring-2 focus:ring-orange-300 focus:border-orange-400"
+                />
+                {filterInput && (
+                  <button
+                    onClick={clearFilter}
+                    title="Clear filter"
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+              <button
+                onClick={applyFilter}
+                disabled={filterInput === (seriesFilter ?? '')}
+                title="Apply series name filter"
+                className={`px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
+                  filterInput === (seriesFilter ?? '')
+                    ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                    : 'bg-orange-500 text-white hover:bg-orange-600'
+                }`}
+              >
+                Apply
+              </button>
             </div>
           )}
           {selectedSeries && (

@@ -2,16 +2,6 @@
 
 import { useState, useRef, useMemo, useEffect } from 'react';
 
-/** Debounce a fast-changing value (e.g. text input) so downstream
- *  useMemos don't re-run on every keystroke. */
-function useDebouncedValue<T>(value: T, delay = 200): T {
-  const [debounced, setDebounced] = useState(value);
-  useEffect(() => {
-    const id = setTimeout(() => setDebounced(value), delay);
-    return () => clearTimeout(id);
-  }, [value, delay]);
-  return debounced;
-}
 import { ProcessedData, combineProcessedData, filterTradesBySeries, Trade, MatchedTrade, fetchSeriesMetadata, fetchMarketSettlements, parseTickerComponents, SettlementResult } from '@/utils/processData';
 
 // Process a single CSV file in a Web Worker so the UI stays responsive on
@@ -76,12 +66,10 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
   const categoryMapFetched = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Debounce the filter text so heavy useMemos don't re-run on every
-  // keystroke. The input itself stays controlled by the raw `seriesFilter`
-  // value so the user sees their typing immediately; only downstream
-  // computations wait for a 200ms pause.
-  const debouncedSeriesFilter = useDebouncedValue(seriesFilter, 200);
-  const seriesFilterUpper = debouncedSeriesFilter.toUpperCase();
+  // Filter is committed explicitly by the user via Apply button in
+  // SeriesStatsTable — heavy useMemos only re-run on commit, not per
+  // keystroke. No debounce needed.
+  const seriesFilterUpper = seriesFilter.toUpperCase();
 
   // Helper to check if a date matches the selected month/day filters
   const matchesDateFilter = (date: Date): boolean => {
