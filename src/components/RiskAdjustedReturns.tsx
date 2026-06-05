@@ -114,19 +114,19 @@ const calculateRiskMetrics = (matchedTrades: MatchedTrade[], initialCapital: num
   const finalValue = portfolioValueArray[portfolioValueArray.length - 1].value;
   const totalReturn = (finalValue - initialCapital) / initialCapital;
 
-  // Calculate trading period metrics for annualization
+  // Daily returns span every calendar day in the range, so annualize on a
+  // calendar-day basis (365) to stay consistent with the return series.
   const tradingDays = activeDailyReturns.length;
-  const totalDays = dailyReturns.length;
-  const expectedYearlyTradingDays = 252; // Standard trading days per year
+  const daysPerYear = 365;
 
   // Annualize metrics
-  const annualizedReturn = avgDailyReturn * expectedYearlyTradingDays;
-  const annualizedVolatility = standardDeviation * Math.sqrt(expectedYearlyTradingDays);
-  
-  // Calculate Sharpe ratio
+  const annualizedReturn = avgDailyReturn * daysPerYear;
+  const annualizedVolatility = standardDeviation * Math.sqrt(daysPerYear);
+
+  // Calculate Sharpe ratio (risk-free rate assumed 0)
   const excessReturn = avgDailyReturn;
   const sharpeRatio = standardDeviation !== 0 ? excessReturn / standardDeviation : 0;
-  const annualizedSharpe = sharpeRatio * Math.sqrt(expectedYearlyTradingDays);
+  const annualizedSharpe = sharpeRatio * Math.sqrt(daysPerYear);
 
   return {
     totalReturn,
@@ -180,7 +180,7 @@ export default function RiskAdjustedReturns({ matchedTrades }: RiskAdjustedRetur
         </div>
         
         <div className="text-sm text-gray-600 mb-4">
-          Portfolio Value Method - Daily returns calculated from portfolio value changes, using initial capital of ${metrics.initialCapital.toLocaleString()}
+          Daily returns on a calendar-day basis (annualized ×√365). Port size = initial capital ${metrics.initialCapital.toLocaleString()} + cumulative realized P&L; each trade&apos;s P&L is booked on its exit day (no mark-to-market).
         </div>
         
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -222,7 +222,7 @@ export default function RiskAdjustedReturns({ matchedTrades }: RiskAdjustedRetur
         <div className="mt-6 pt-6 border-t border-gray-200">
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
             <div>
-              <div className="text-gray-500">Trading Days</div>
+              <div className="text-gray-500">Active Days</div>
               <div className="font-semibold">{metrics.tradingDays}</div>
             </div>
             <div>
