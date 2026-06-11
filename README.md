@@ -1,8 +1,10 @@
 # Kalshi Dashboard
 
-A performance tracker for Kalshi traders. Upload the transaction CSVs from your Kalshi account and it plots your PnL over time and breaks down the stats: per-series performance, maker/taker split, yes/no direction, settlement outcomes, and risk-adjusted returns (variance, Sharpe).
+A performance tracker for Kalshi traders. Upload the transaction CSVs from your Kalshi account and it plots your PnL over time and displays useful stats: per-series performance, maker/taker split, yes/no direction, settlement vs. market exit outcomes, and risk-adjusted returns (variance, Sharpe).
 
 Everything runs client-side, so your trading data never leaves the browser.
+
+Supports multi-csv upload to cover multiple years of trading.
 
 Live version: [jsteng19.github.io/kalshi-dash](https://jsteng19.github.io/kalshi-dash/)
 
