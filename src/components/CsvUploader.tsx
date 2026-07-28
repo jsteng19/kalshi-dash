@@ -2,7 +2,7 @@
 
 import { useState, useRef, useMemo } from 'react';
 import Papa from 'papaparse';
-import { processCSVData, ProcessedData, combineProcessedData, filterTradesBySeries, Trade, MatchedTrade } from '@/utils/processData';
+import { processCSVData, ProcessedData, combineProcessedData, filterTradesBySeries, normalizeHeader, Trade, MatchedTrade } from '@/utils/processData';
 import Overview from '@/components/Overview';
 import PnlChart from './PnlChart';
 import TradeDirectionPie from './TradeDirectionPie';
@@ -128,6 +128,9 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
         const results = await new Promise((resolve, reject) => {
           Papa.parse(file, {
             header: true,
+            // Without this a UTF-8 BOM survives into the row keys, not just the
+            // header list, and every row parses as empty. See docs/defects.md D-003.
+            transformHeader: normalizeHeader,
             complete: resolve,
             error: reject,
           });
