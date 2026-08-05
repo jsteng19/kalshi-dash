@@ -1,6 +1,6 @@
 'use client';
 
-import React from 'react';
+import React, { useMemo } from 'react';
 import { MatchedTrade } from '@/utils/processData';
 
 interface TradeListProps {
@@ -8,10 +8,12 @@ interface TradeListProps {
 }
 
 export default function TradeList({ trades }: TradeListProps) {
-  // Get only the most recent 5 trades
-  const recentTrades = [...trades]
-    .sort((a, b) => new Date(b.Exit_Date).getTime() - new Date(a.Exit_Date).getTime())
-    .slice(0, 5);
+  const recentTrades = useMemo(() =>
+    [...trades]
+      .sort((a, b) => b.Exit_Date.getTime() - a.Exit_Date.getTime())
+      .slice(0, 5),
+    [trades]
+  );
 
   const formatDate = (date: Date) => {
     return new Date(date).toLocaleDateString('en-US', {

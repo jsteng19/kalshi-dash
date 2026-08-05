@@ -1,6 +1,6 @@
 'use client';
 
-import React from 'react';
+import React, { useMemo } from 'react';
 import { MatchedTrade } from '@/utils/processData';
 
 interface OverviewProps {
@@ -56,38 +56,37 @@ export default function Overview({ stats, matchedTrades }: OverviewProps) {
     return value.toFixed(1) + ' days';
   };
 
-  // Calculate total risked (entry cost) and average PNL per dollar risked
-  const totalRisked = matchedTrades.reduce((sum, trade) => sum + trade.Entry_Cost, 0);
-  const totalProfit = matchedTrades.reduce((sum, trade) => sum + trade.Net_Profit, 0);
-  const avgPnlPerDollarRisked = totalRisked > 0 ? totalProfit / totalRisked : 0;
+  const { avgPnlPerDollarRisked, maxTicker, maxProfit, minTicker, minProfit, highestROITrade, highestROI } = useMemo(() => {
+    let totalRisked = 0;
+    let totalProfit = 0;
+    const profitByTicker: Record<string, number> = {};
+    let highestROITrade: MatchedTrade | null = null;
+    let highestROI = -Infinity;
 
-  // Calculate profit by ticker using matched trades
-  const profitByTicker = matchedTrades.reduce((acc, trade) => {
-    acc[trade.Ticker] = (acc[trade.Ticker] || 0) + trade.Net_Profit;
-    return acc;
-  }, {} as Record<string, number>);
+    for (const trade of matchedTrades) {
+      totalRisked += trade.Entry_Cost;
+      totalProfit += trade.Net_Profit;
+      profitByTicker[trade.Ticker] = (profitByTicker[trade.Ticker] || 0) + trade.Net_Profit;
+      if (trade.Entry_Cost > 0) {
+        const roi = trade.ROI ?? (trade.Net_Profit / trade.Entry_Cost);
+        if (roi > highestROI) { highestROI = roi; highestROITrade = trade; }
+      }
+    }
 
-  // Find best and worst tickers
-  const entries = Object.entries(profitByTicker);
-  const [maxTicker, maxProfit] = entries.length
-    ? entries.reduce(([t, p], [t2, p2]) => (p2 > p ? [t2, p2] : [t, p]))
-    : ['N/A', 0];
-  const [minTicker, minProfit] = entries.length
-    ? entries.reduce(([t, p], [t2, p2]) => (p2 < p ? [t2, p2] : [t, p]))
-    : ['N/A', 0];
+    const entries = Object.entries(profitByTicker);
+    const [maxTicker, maxProfit] = entries.length
+      ? entries.reduce(([t, p], [t2, p2]) => (p2 > p ? [t2, p2] : [t, p]))
+      : ['N/A', 0];
+    const [minTicker, minProfit] = entries.length
+      ? entries.reduce(([t, p], [t2, p2]) => (p2 < p ? [t2, p2] : [t, p]))
+      : ['N/A', 0];
 
-  // Find highest ROI trade
-  const [highestROITrade, highestROI] = matchedTrades.reduce<[MatchedTrade | null, number]>((best, trade) => {
-    // Skip trades with zero or negative investment
-    if (trade.Entry_Cost <= 0) return best;
-    
-    const currentROI = trade.ROI || (trade.Net_Profit / trade.Entry_Cost);
-    
-    // Get previous best ROI for comparison
-    const [, bestROI] = best;
-    
-    return currentROI > bestROI ? [trade, currentROI] : best;
-  }, [null, -Infinity]);
+    return {
+      avgPnlPerDollarRisked: totalRisked > 0 ? totalProfit / totalRisked : 0,
+      maxTicker, maxProfit, minTicker, minProfit,
+      highestROITrade, highestROI: highestROI === -Infinity ? 0 : highestROI,
+    };
+  }, [matchedTrades]);
 
   return (
     <div className="mt-6">
