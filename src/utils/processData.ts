@@ -3,22 +3,62 @@ import { toDate } from 'date-fns-tz';
 
 // ============ CSV FORMAT DETECTION ============
 
-export type CsvFormat = 'legacy' | 'new';
+export type CsvFormat = 'legacy' | 'modern-cents' | 'modern-dollars';
 
-// New format columns (2025+)
-const NEW_FORMAT_COLUMNS = ['type', 'quantity', 'market_ticker', 'side', 'entry_price_cents', 'exit_price_cents', 'open_fees_cents', 'close_fees_cents', 'realized_pnl_without_fees_cents', 'realized_pnl_with_fees_cents', 'close_timestamp', 'open_timestamp'];
+// Modern format columns, decimal-dollar variant — what Kalshi exports today
+const MODERN_DOLLARS_COLUMNS: readonly string[] = ['type', 'quantity_fp', 'market_ticker', 'side', 'entry_price_dollars', 'exit_price_dollars', 'open_fees_dollars', 'close_fees_dollars', 'realized_pnl_without_fees_dollars', 'realized_pnl_with_fees_dollars', 'close_timestamp', 'open_timestamp'];
+
+// Modern format columns, integer-cent variant — the earlier 2025 schema
+const MODERN_CENTS_COLUMNS: readonly string[] = ['type', 'quantity', 'market_ticker', 'side', 'entry_price_cents', 'exit_price_cents', 'open_fees_cents', 'close_fees_cents', 'realized_pnl_without_fees_cents', 'realized_pnl_with_fees_cents', 'close_timestamp', 'open_timestamp'];
 
 // Legacy format columns
-const LEGACY_FORMAT_COLUMNS = ['Ticker', 'Type', 'Direction', 'Contracts', 'Average_Price', 'Created'];
+const LEGACY_FORMAT_COLUMNS: readonly string[] = ['Ticker', 'Type', 'Direction', 'Contracts', 'Average_Price', 'Created'];
+
+/** Strips a leading UTF-8 BOM (U+FEFF) and surrounding whitespace from a header name. */
+export const normalizeHeader = (header: string): string =>
+  header.replace(/^\uFEFF/, '').trim();
+
+const FORMAT_CANDIDATES: readonly { format: CsvFormat; columns: readonly string[] }[] = [
+  { format: 'modern-dollars', columns: MODERN_DOLLARS_COLUMNS },
+  { format: 'modern-cents', columns: MODERN_CENTS_COLUMNS },
+  { format: 'legacy', columns: LEGACY_FORMAT_COLUMNS },
+];
+
+const MAX_HEADERS_IN_ERROR = 20;
+
+const describeHeaders = (headers: string[]): string => {
+  const shown = headers.slice(0, MAX_HEADERS_IN_ERROR).join(', ');
+  const overflow = headers.length > MAX_HEADERS_IN_ERROR
+    ? ` …(+${headers.length - MAX_HEADERS_IN_ERROR} more)`
+    : '';
+  return `Headers seen (${headers.length}): ${shown}${overflow}`;
+};
 
 export const detectCsvFormat = (headers: string[]): CsvFormat => {
-  const hasNewFormat = NEW_FORMAT_COLUMNS.every(col => headers.includes(col));
-  if (hasNewFormat) return 'new';
-  
-  const hasLegacyFormat = LEGACY_FORMAT_COLUMNS.every(col => headers.includes(col));
-  if (hasLegacyFormat) return 'legacy';
-  
-  throw new Error(`Unrecognized CSV format. Expected columns for either new format (${NEW_FORMAT_COLUMNS.slice(0, 3).join(', ')}...) or legacy format (${LEGACY_FORMAT_COLUMNS.join(', ')})`);
+  const normalized = headers.map(normalizeHeader);
+
+  const scored = FORMAT_CANDIDATES.map(candidate => ({
+    format: candidate.format,
+    missing: candidate.columns.filter(col => !normalized.includes(col)),
+  }));
+
+  const matched = scored.find(candidate => candidate.missing.length === 0);
+  if (matched) return matched.format;
+
+  // Closest match = fewest missing columns; ties keep declaration order.
+  const ranked = [...scored].sort((a, b) => a.missing.length - b.missing.length);
+  const closest = ranked[0];
+  const alsoTried = ranked
+    .slice(1)
+    .map(candidate => `${candidate.format} (${candidate.missing.length} missing)`)
+    .join(', ');
+
+  throw new Error(
+    `Unrecognized CSV format.\n`
+    + `${describeHeaders(normalized)}\n`
+    + `Closest match: ${closest.format} — missing ${closest.missing.length} column(s): ${closest.missing.join(', ')}\n`
+    + `Also tried: ${alsoTried}`,
+  );
 };
 
 // ============ INTERFACES ============
@@ -535,9 +575,14 @@ const calculateBasicStats = (trades: Trade[], matchedTrades: MatchedTrade[]) => 
   };
 };
 
-// ============ NEW FORMAT PARSER (2025+) ============
+// ============ MODERN FORMAT PARSER (2025+) ============
 
-interface NewFormatRow {
+/**
+ * Row shapes as Papa Parse hands them over: every value is still a string.
+ * The two variants differ only in column names and in the unit of every
+ * monetary field (integer cents vs. decimal dollars).
+ */
+interface ModernCentsRow {
   type: string;
   quantity: string;
   market_ticker: string;
@@ -552,102 +597,250 @@ interface NewFormatRow {
   open_timestamp: string;
 }
 
-const processNewFormat = (rawData: NewFormatRow[]): { trades: Trade[], matchedTrades: MatchedTrade[] } => {
+interface ModernDollarsRow {
+  type: string;
+  quantity_fp: string;
+  market_ticker: string;
+  side: string;
+  entry_price_dollars: string;
+  exit_price_dollars: string;
+  open_fees_dollars: string;
+  close_fees_dollars: string;
+  realized_pnl_without_fees_dollars: string;
+  realized_pnl_with_fees_dollars: string;
+  close_timestamp: string;
+  open_timestamp: string;
+}
+
+/**
+ * Unit-normalised intermediate. Prices are fractional cents; every other
+ * monetary value is dollars. Quantities keep their fraction. This shape is
+ * module-local and never crosses a module boundary.
+ */
+interface ModernTradeFields {
+  type: string;
+  ticker: string;
+  side: string;
+  quantityContracts: number;
+  entryPriceCents: number;
+  exitPriceCents: number;
+  openFeesDollars: number;
+  closeFeesDollars: number;
+  pnlWithoutFeesDollars: number;
+  pnlWithFeesDollars: number;
+  openTimestamp: string;
+  closeTimestamp: string;
+}
+
+/**
+ * parseFloat after stripping currency decoration ($, thousands separators,
+ * whitespace). Returns null on an empty or unparseable value -- never 0, because
+ * 0 is a legitimate price, fee and PnL.
+ */
+const parseMoneyField = (raw: string | undefined): number | null => {
+  if (typeof raw !== 'string') return null;
+  const cleaned = raw.replace(/[$,\s]/g, '');
+  if (cleaned === '') return null;
+  const value = parseFloat(cleaned);
+  return Number.isNaN(value) ? null : value;
+};
+
+const warnUnparseableField = (rowIndex: number, field: string): null => {
+  console.warn(`Skipping row ${rowIndex}: unparseable numeric field "${field}"`);
+  return null;
+};
+
+const modernCentsRowToFields = (row: ModernCentsRow, rowIndex: number): ModernTradeFields | null => {
+  const quantityContracts = parseMoneyField(row.quantity);
+  if (quantityContracts === null) return warnUnparseableField(rowIndex, 'quantity');
+
+  const entryPriceCents = parseMoneyField(row.entry_price_cents);
+  if (entryPriceCents === null) return warnUnparseableField(rowIndex, 'entry_price_cents');
+
+  const exitPriceCents = parseMoneyField(row.exit_price_cents);
+  if (exitPriceCents === null) return warnUnparseableField(rowIndex, 'exit_price_cents');
+
+  const openFeesCents = parseMoneyField(row.open_fees_cents);
+  if (openFeesCents === null) return warnUnparseableField(rowIndex, 'open_fees_cents');
+
+  const closeFeesCents = parseMoneyField(row.close_fees_cents);
+  if (closeFeesCents === null) return warnUnparseableField(rowIndex, 'close_fees_cents');
+
+  const pnlWithoutFeesCents = parseMoneyField(row.realized_pnl_without_fees_cents);
+  if (pnlWithoutFeesCents === null) return warnUnparseableField(rowIndex, 'realized_pnl_without_fees_cents');
+
+  const pnlWithFeesCents = parseMoneyField(row.realized_pnl_with_fees_cents);
+  if (pnlWithFeesCents === null) return warnUnparseableField(rowIndex, 'realized_pnl_with_fees_cents');
+
+  return {
+    type: row.type,
+    ticker: row.market_ticker,
+    side: row.side,
+    quantityContracts,
+    entryPriceCents,
+    exitPriceCents,
+    openFeesDollars: openFeesCents / 100,
+    closeFeesDollars: closeFeesCents / 100,
+    pnlWithoutFeesDollars: pnlWithoutFeesCents / 100,
+    pnlWithFeesDollars: pnlWithFeesCents / 100,
+    openTimestamp: row.open_timestamp,
+    closeTimestamp: row.close_timestamp,
+  };
+};
+
+const modernDollarsRowToFields = (row: ModernDollarsRow, rowIndex: number): ModernTradeFields | null => {
+  const quantityContracts = parseMoneyField(row.quantity_fp);
+  if (quantityContracts === null) return warnUnparseableField(rowIndex, 'quantity_fp');
+
+  const entryPriceDollars = parseMoneyField(row.entry_price_dollars);
+  if (entryPriceDollars === null) return warnUnparseableField(rowIndex, 'entry_price_dollars');
+
+  const exitPriceDollars = parseMoneyField(row.exit_price_dollars);
+  if (exitPriceDollars === null) return warnUnparseableField(rowIndex, 'exit_price_dollars');
+
+  const openFeesDollars = parseMoneyField(row.open_fees_dollars);
+  if (openFeesDollars === null) return warnUnparseableField(rowIndex, 'open_fees_dollars');
+
+  const closeFeesDollars = parseMoneyField(row.close_fees_dollars);
+  if (closeFeesDollars === null) return warnUnparseableField(rowIndex, 'close_fees_dollars');
+
+  const pnlWithoutFeesDollars = parseMoneyField(row.realized_pnl_without_fees_dollars);
+  if (pnlWithoutFeesDollars === null) return warnUnparseableField(rowIndex, 'realized_pnl_without_fees_dollars');
+
+  const pnlWithFeesDollars = parseMoneyField(row.realized_pnl_with_fees_dollars);
+  if (pnlWithFeesDollars === null) return warnUnparseableField(rowIndex, 'realized_pnl_with_fees_dollars');
+
+  return {
+    type: row.type,
+    ticker: row.market_ticker,
+    side: row.side,
+    quantityContracts,
+    entryPriceCents: entryPriceDollars * 100,
+    exitPriceCents: exitPriceDollars * 100,
+    openFeesDollars,
+    closeFeesDollars,
+    pnlWithoutFeesDollars,
+    pnlWithFeesDollars,
+    openTimestamp: row.open_timestamp,
+    closeTimestamp: row.close_timestamp,
+  };
+};
+
+/** Applies a row mapper, dropping and counting rows whose numbers will not parse. */
+const mapModernRows = <TRow>(
+  rawRows: TRow[],
+  toFields: (row: TRow, rowIndex: number) => ModernTradeFields | null,
+): ModernTradeFields[] => {
+  const fields: ModernTradeFields[] = [];
+  let unparseableRows = 0;
+
+  rawRows.forEach((row, index) => {
+    const mapped = toFields(row, index);
+    if (mapped === null) {
+      unparseableRows++;
+      return;
+    }
+    fields.push(mapped);
+  });
+
+  if (unparseableRows > 0) {
+    console.warn(`Modern format: ${unparseableRows} row(s) skipped for unparseable numeric fields`);
+  }
+
+  return fields;
+};
+
+const processModernFormat = (rows: ModernTradeFields[]): { trades: Trade[], matchedTrades: MatchedTrade[] } => {
   const trades: Trade[] = [];
   const matchedTrades: MatchedTrade[] = [];
   let skippedRows = 0;
-  
-  rawData.forEach((row, index) => {
-    try {
-      if (!row.market_ticker || row.type !== 'trade') return;
-      
-      // Skip rows with missing timestamps
-      if (!row.open_timestamp || !row.close_timestamp) {
-        skippedRows++;
-        return;
-      }
-      
-      const quantity = parseInt(row.quantity) || 0;
-      if (quantity === 0) return; // Skip zero quantity trades
-      
-      const entryPrice = parseInt(row.entry_price_cents) || 0;
-      const exitPrice = parseInt(row.exit_price_cents) || 0;
-      const openFees = (parseInt(row.open_fees_cents) || 0) / 100; // Convert to dollars
-      const closeFees = (parseInt(row.close_fees_cents) || 0) / 100;
-      const pnlWithFees = (parseInt(row.realized_pnl_with_fees_cents) || 0) / 100;
-      const pnlWithoutFees = (parseInt(row.realized_pnl_without_fees_cents) || 0) / 100;
-      const totalFees = openFees + closeFees;
-      
-      const entryDate = new Date(row.open_timestamp);
-      const exitDate = new Date(row.close_timestamp);
-      
-      // Validate dates
-      if (isNaN(entryDate.getTime()) || isNaN(exitDate.getTime())) {
-        skippedRows++;
-        console.warn(`Skipping row ${index}: Invalid date - open: "${row.open_timestamp}", close: "${row.close_timestamp}"`);
-        return;
-      }
-      
-      // Validate and normalize direction
-      const side = row.side?.toLowerCase();
-      if (side !== 'yes' && side !== 'no') {
-        skippedRows++;
-        return;
-      }
-      const direction = side === 'yes' ? 'Yes' : 'No';
-      
-      // Determine exit type based on exit price (0 or 100 = settlement, otherwise trade)
-      const exitType = (exitPrice === 0 || exitPrice === 100) ? 'settlement' : 'trade';
-      
-      // Create a Trade object for compatibility with existing stats calculations
-      // This represents a "virtual" exit trade in the legacy format
-      const entryCost = (quantity * entryPrice) / 100; // Convert cents to dollars
-      const trade: Trade = {
-        Ticker: row.market_ticker,
-        Type: exitType,
-        Direction: direction,
-        Contracts: quantity,
-        Average_Price: entryPrice, // Entry price in cents
-        Realized_Revenue: exitType === 'settlement' ? (exitPrice === 100 ? quantity : 0) : quantity,
-        Realized_Cost: entryCost,
-        Realized_Profit: pnlWithFees,
-        Fees: totalFees,
-        Created: row.close_timestamp,
-        Date: exitDate,
-        Trade_Cost: entryCost,
-      };
-      trades.push(trade);
-      
-      // Create MatchedTrade directly (no FIFO matching needed)
-      const holdingDays = (exitDate.getTime() - entryDate.getTime()) / (24 * 3600 * 1000);
-      const matchedTrade: MatchedTrade = {
-        Ticker: row.market_ticker,
-        Entry_Date: entryDate,
-        Exit_Date: exitDate,
-        Entry_Direction: direction,
-        Exit_Type: exitType,
-        Contracts: quantity,
-        Entry_Cost: entryCost,
-        Realized_Profit: pnlWithoutFees,
-        Net_Profit: pnlWithFees,
-        Holding_Period_Days: holdingDays,
-        ROI: entryCost > 0 ? pnlWithFees / entryCost : 0,
-        Entry_Fee: openFees,
-        Exit_Fee: closeFees,
-        Total_Fees: totalFees,
-        Entry_Price: entryPrice,
-        Exit_Price: exitPrice,
-      };
-      matchedTrades.push(matchedTrade);
-      
-    } catch (error) {
-      console.error("Error processing new format row:", row, error);
+
+  rows.forEach((row, index) => {
+    if (!row.ticker || row.type !== 'trade') {
       skippedRows++;
+      return;
     }
+
+    // Skip rows with missing timestamps
+    if (!row.openTimestamp || !row.closeTimestamp) {
+      skippedRows++;
+      return;
+    }
+
+    if (row.quantityContracts === 0) {
+      skippedRows++;
+      return; // Skip zero quantity trades
+    }
+
+    const entryDate = new Date(row.openTimestamp);
+    const exitDate = new Date(row.closeTimestamp);
+
+    // Validate dates
+    if (isNaN(entryDate.getTime()) || isNaN(exitDate.getTime())) {
+      skippedRows++;
+      console.warn(`Skipping row ${index}: Invalid date - open: "${row.openTimestamp}", close: "${row.closeTimestamp}"`);
+      return;
+    }
+
+    // Validate and normalize direction
+    const side = row.side?.toLowerCase();
+    if (side !== 'yes' && side !== 'no') {
+      skippedRows++;
+      return;
+    }
+    const direction = side === 'yes' ? 'Yes' : 'No';
+
+    // Determine exit type based on exit price (0 or 100 = settlement, otherwise trade)
+    const exitType = (row.exitPriceCents === 0 || row.exitPriceCents === 100) ? 'settlement' : 'trade';
+
+    const totalFeesDollars = row.openFeesDollars + row.closeFeesDollars;
+
+    // Create a Trade object for compatibility with existing stats calculations
+    // This represents a "virtual" exit trade in the legacy format
+    const entryCostDollars = (row.quantityContracts * row.entryPriceCents) / 100; // cents -> dollars
+    const trade: Trade = {
+      Ticker: row.ticker,
+      Type: exitType,
+      Direction: direction,
+      Contracts: row.quantityContracts,
+      Average_Price: row.entryPriceCents, // Entry price in cents
+      Realized_Revenue: exitType === 'settlement' ? (row.exitPriceCents === 100 ? row.quantityContracts : 0) : row.quantityContracts,
+      Realized_Cost: entryCostDollars,
+      Realized_Profit: row.pnlWithFeesDollars,
+      Fees: totalFeesDollars,
+      Created: row.closeTimestamp,
+      Date: exitDate,
+      Trade_Cost: entryCostDollars,
+    };
+    trades.push(trade);
+
+    // Create MatchedTrade directly (no FIFO matching needed)
+    const holdingDays = (exitDate.getTime() - entryDate.getTime()) / (24 * 3600 * 1000);
+    const matchedTrade: MatchedTrade = {
+      Ticker: row.ticker,
+      Entry_Date: entryDate,
+      Exit_Date: exitDate,
+      Entry_Direction: direction,
+      Exit_Type: exitType,
+      Contracts: row.quantityContracts,
+      Entry_Cost: entryCostDollars,
+      Realized_Profit: row.pnlWithoutFeesDollars,
+      Net_Profit: row.pnlWithFeesDollars,
+      Holding_Period_Days: holdingDays,
+      ROI: entryCostDollars > 0 ? row.pnlWithFeesDollars / entryCostDollars : 0,
+      Entry_Fee: row.openFeesDollars,
+      Exit_Fee: row.closeFeesDollars,
+      Total_Fees: totalFeesDollars,
+      Entry_Price: row.entryPriceCents,
+      Exit_Price: row.exitPriceCents,
+    };
+    matchedTrades.push(matchedTrade);
   });
-  
-  console.log(`New format processing: ${matchedTrades.length} trades processed, ${skippedRows} rows skipped`);
-  
+
+  if (skippedRows > 0) {
+    console.warn(`Modern format: ${matchedTrades.length} trade(s) processed, ${skippedRows} row(s) skipped`);
+  }
+
   return { trades, matchedTrades };
 };
 
@@ -771,8 +964,11 @@ export const processCSVData = (results: any): ProcessedData => {
     let matchedTrades: MatchedTrade[];
     let basicStats: ProcessedData['basicStats'];
     
-    if (format === 'new') {
-      const processed = processNewFormat(rawData);
+    if (format === 'modern-dollars' || format === 'modern-cents') {
+      const modernRows = format === 'modern-dollars'
+        ? mapModernRows(rawData as ModernDollarsRow[], modernDollarsRowToFields)
+        : mapModernRows(rawData as ModernCentsRow[], modernCentsRowToFields);
+      const processed = processModernFormat(modernRows);
       trades = processed.trades;
       matchedTrades = processed.matchedTrades;
       basicStats = calculateBasicStatsFromMatchedTrades(matchedTrades);
